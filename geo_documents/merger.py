@@ -11,7 +11,7 @@ from docx.enum.text import WD_BREAK
 from docx.shared import Inches
 from docxcompose.composer import Composer
 
-from geo_documents.libreoffice import doc_to_docx, docx_to_pdf, find_soffice
+from geo_documents.libreoffice import docx_to_pdf, find_soffice
 
 
 def _prepend_heading(doc: Document, text: str) -> None:
@@ -40,6 +40,7 @@ def _append_pdf_as_images(
             page = src[i]
             pix = page.get_pixmap(dpi=dpi)
             bio = io.BytesIO(pix.tobytes("png"))
+            bio.seek(0)
             par = doc.add_paragraph()
             run = par.add_run()
             run.add_picture(bio, width=Inches(max_width_inches))
@@ -75,18 +76,7 @@ def merge_to_docx_and_pdf(
             continue
         ext = p.suffix.lower()
         if ext == ".doc":
-            if not soffice:
-                errors.append(
-                    f"Нужен LibreOffice для .doc: {p.name} "
-                    "(укажите путь к soffice.exe в поле ниже или установите LibreOffice)."
-                )
-                continue
-            try:
-                cx = doc_to_docx(soffice, p)
-                temp_to_delete.append(cx)
-                work_items.append((cx, p.name))
-            except Exception as e:
-                errors.append(f"Конвертация .doc → docx не удалась ({p.name}): {e}")
+            warnings.append(f"Пропуск .doc без чтения: {p.name}")
             continue
         if ext == ".docx":
             work_items.append((p, p.name))
@@ -97,48 +87,52 @@ def merge_to_docx_and_pdf(
         warnings.append(f"Пропуск (неподдерживаемый тип): {p.name}")
 
     if not work_items:
-        errors.append("Нет ни одного поддерживаемого файла для склейки.")
+        errors.append("Нет ни одного поддерживаемого файла для склейки (.doc пропускаются).")
         return warnings, errors
 
     merged: Document | None = None
     composer: Composer | None = None
 
-    for idx, (src_path, display_name) in enumerate(work_items):
-        ext = src_path.suffix.lower()
-
-        if idx > 0 and page_break_between_parts and merged is not None:
-            _append_page_break(merged)
-
-        if ext == ".pdf":
-            if merged is None:
-                merged = Document()
-                composer = None
-            if insert_titles:
-                merged.add_heading(display_name, level=2)
-            _append_pdf_as_images(merged, src_path, dpi=pdf_render_dpi)
-            continue
-
-        if ext == ".docx":
-            doc = Document(str(src_path))
-            if insert_titles:
-                _prepend_heading(doc, display_name)
-            if merged is None:
-                merged = doc
-                composer = Composer(merged)
-            else:
-                if composer is None:
-                    composer = Composer(merged)
-                composer.append(doc)
-            continue
-
-    assert merged is not None
-
     output_docx = Path(output_docx)
-    output_docx.parent.mkdir(parents=True, exist_ok=True)
     try:
+        for idx, (src_path, display_name) in enumerate(work_items):
+            ext = src_path.suffix.lower()
+
+            if idx > 0 and page_break_between_parts and merged is not None:
+                _append_page_break(merged)
+
+            if ext == ".pdf":
+                if merged is None:
+                    merged = Document()
+                    composer = None
+                if insert_titles:
+                    merged.add_heading(display_name, level=2)
+                _append_pdf_as_images(merged, src_path, dpi=pdf_render_dpi)
+                continue
+
+            if ext == ".docx":
+                doc = Document(str(src_path))
+                if insert_titles:
+                    _prepend_heading(doc, display_name)
+                if merged is None:
+                    merged = doc
+                    composer = Composer(merged)
+                else:
+                    if composer is None:
+                        composer = Composer(merged)
+                    composer.append(doc)
+                continue
+
+        if merged is None:
+            errors.append("Не удалось сформировать документ (неизвестная причина).")
+            for t in temp_to_delete:
+                t.unlink(missing_ok=True)
+            return warnings, errors
+
+        output_docx.parent.mkdir(parents=True, exist_ok=True)
         merged.save(str(output_docx))
     except Exception as e:
-        errors.append(f"Сохранение DOCX не удалось: {e}\n{traceback.format_exc()}")
+        errors.append(f"Ошибка при склейке или сохранении DOCX: {e}\n{traceback.format_exc()}")
         for t in temp_to_delete:
             t.unlink(missing_ok=True)
         return warnings, errors

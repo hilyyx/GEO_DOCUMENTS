@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -26,6 +26,50 @@ from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
 from geo_documents.merger import merge_to_docx_and_pdf
 
 
+class _MergeThread(QThread):
+    """Склейка в отдельном потоке, чтобы окно не уходило в «Не отвечает» и не закрывалось ОС."""
+
+    done = pyqtSignal(list, list)
+    crashed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        paths: list[Path],
+        out_docx: Path,
+        out_pdf: Path,
+        page_break: bool,
+        insert_titles: bool,
+        dpi: int,
+        lo_path: str | None,
+    ) -> None:
+        super().__init__()
+        self._paths = paths
+        self._out_docx = out_docx
+        self._out_pdf = out_pdf
+        self._page_break = page_break
+        self._insert_titles = insert_titles
+        self._dpi = dpi
+        self._lo_path = lo_path
+
+    def run(self) -> None:
+        import traceback
+
+        try:
+            warnings, errors = merge_to_docx_and_pdf(
+                self._paths,
+                self._out_docx,
+                self._out_pdf,
+                page_break_between_parts=self._page_break,
+                insert_titles=self._insert_titles,
+                pdf_render_dpi=self._dpi,
+                libreoffice_executable=self._lo_path,
+            )
+            self.done.emit(warnings, errors)
+        except Exception:
+            self.crashed.emit(traceback.format_exc())
+
+
 def _human_sort_key(name: str) -> str:
     return repr(sort_key_from_filename(name))
 
@@ -33,12 +77,13 @@ def _human_sort_key(name: str) -> str:
 class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Склейка отчётов (PDF / DOCX / DOC)")
+        self.setWindowTitle("Склейка отчётов (PDF / DOCX)")
         self.resize(880, 560)
 
         self._folder = Path.home()
         self._paths: list[Path] = []
         self._settings = QSettings("GEO_DOCUMENTS", "merge_app")
+        self._merge_thread: _MergeThread | None = None
 
         root = QVBoxLayout(self)
 
@@ -120,8 +165,9 @@ class MainWindow(QWidget):
         root.addWidget(self.btn_merge)
 
         lo_hint = QLabel(
-            "Для .doc и экспорта в PDF нужен LibreOffice: укажите путь к soffice.exe выше "
-            "(или переменную окружения LIBREOFFICE_EXECUTABLE). Путь сохраняется между запусками."
+            "Для экспорта в PDF нужен LibreOffice: укажите путь к soffice.exe выше "
+            "(или переменную окружения LIBREOFFICE_EXECUTABLE). Путь сохраняется между запусками. "
+            "Файлы .doc не читаются и пропускаются."
         )
         lo_hint.setWordWrap(True)
         root.addWidget(lo_hint)
@@ -153,7 +199,7 @@ class MainWindow(QWidget):
         found: list[Path] = []
         for name in os.listdir(self._folder):
             low = name.lower()
-            if low.endswith((".pdf", ".docx", ".doc")):
+            if low.endswith((".pdf", ".docx")):
                 if low.startswith("~$"):
                     continue
                 found.append(self._folder / name)
@@ -200,7 +246,7 @@ class MainWindow(QWidget):
             self,
             "Добавить файлы",
             str(self._folder),
-            "Документы (*.pdf *.docx *.doc);;Все файлы (*.*)",
+            "Документы (*.pdf *.docx);;Все файлы (*.*)",
         )
         if not files:
             return
@@ -216,6 +262,8 @@ class MainWindow(QWidget):
             self.list_w.addItem(it)
 
     def _merge(self) -> None:
+        if self._merge_thread is not None and self._merge_thread.isRunning():
+            return
         paths = self._paths_from_list()
         if not paths:
             QMessageBox.warning(self, "Склейка", "Список файлов пуст.")
@@ -224,26 +272,40 @@ class MainWindow(QWidget):
         out_dir = self._folder if self._folder.is_dir() else Path.cwd()
         out_docx = out_dir / f"{base}.docx"
         out_pdf = out_dir / f"{base}.pdf"
-
         lo_path = self.ed_soffice.text().strip() or None
-        self.btn_merge.setEnabled(False)
-        try:
-            warnings, errors = merge_to_docx_and_pdf(
-                paths,
-                out_docx,
-                out_pdf,
-                page_break_between_parts=self.cb_page_break.isChecked(),
-                insert_titles=self.cb_titles.isChecked(),
-                pdf_render_dpi=int(self.sp_dpi.value()),
-                libreoffice_executable=lo_path,
-            )
-        finally:
-            self.btn_merge.setEnabled(True)
 
+        th = _MergeThread(
+            paths=paths,
+            out_docx=out_docx,
+            out_pdf=out_pdf,
+            page_break=self.cb_page_break.isChecked(),
+            insert_titles=self.cb_titles.isChecked(),
+            dpi=int(self.sp_dpi.value()),
+            lo_path=lo_path,
+        )
+        self._merge_thread = th
+        th.done.connect(self._on_merge_done)
+        th.crashed.connect(self._on_merge_crashed)
+        th.finished.connect(th.deleteLater)
+        self.btn_merge.setEnabled(False)
+        th.start()
+
+    def _merge_ui_unlock(self) -> None:
+        self.btn_merge.setEnabled(True)
+        self._merge_thread = None
+
+    def _on_merge_done(self, warnings: list[str], errors: list[str]) -> None:
+        lo_path = self.ed_soffice.text().strip() or None
         if lo_path:
             self._settings.setValue("libreoffice_soffice", lo_path)
 
         msg_lines: list[str] = []
+        base = self.ed_basename.text().strip() or "merged_report"
+        out_dir = self._folder if self._folder.is_dir() else Path.cwd()
+        out_docx = out_dir / f"{base}.docx"
+        out_pdf = out_dir / f"{base}.pdf"
+        if out_docx.is_file() or out_pdf.is_file():
+            msg_lines.append("Сохранено:")
         if out_docx.is_file():
             msg_lines.append(f"DOCX: {out_docx}")
         if out_pdf.is_file():
@@ -255,3 +317,13 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Склейка завершена с ошибками", "\n".join(msg_lines))
         else:
             QMessageBox.information(self, "Готово", "\n".join(msg_lines) or "Готово.")
+        self._merge_ui_unlock()
+
+    def _on_merge_crashed(self, tb: str) -> None:
+        QMessageBox.critical(
+            self,
+            "Сбой при склейке",
+            "Произошла внутренняя ошибка (подробности ниже). "
+            "Если используете .exe — пришлите этот текст разработчику.\n\n" + tb,
+        )
+        self._merge_ui_unlock()

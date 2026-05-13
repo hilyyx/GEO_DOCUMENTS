@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
-datas = []
+datas = collect_data_files("docx")
+datas += collect_data_files("docxcompose")
 binaries = []
 hiddenimports = [
     'docxcompose',
