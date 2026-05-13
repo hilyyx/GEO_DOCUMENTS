@@ -15,10 +15,11 @@ hiddenimports = [
     'babel.dates',
     'fitz',
 ]
-tmp_ret = collect_all('PyQt6')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# PyQt6: достаточно стандартных hooks PyInstaller (только реально импортируемые модули).
 tmp_ret = collect_all('pymupdf')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -46,7 +47,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
