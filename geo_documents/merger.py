@@ -31,6 +31,8 @@ def _prepend_heading(doc: Document, text: str) -> None:
 
 
 def _append_page_break(doc: Document) -> None:
+    if document_ends_with_page_forcing_break(doc):
+        return
     p = doc.add_paragraph()
     p.add_run().add_break(WD_BREAK.PAGE)
 
@@ -41,32 +43,48 @@ def _has_body_content(doc: Document) -> bool:
 
 def _section_is_landscape(doc: Document) -> bool:
     section = doc.sections[-1]
-    return section.page_width > section.page_height
+    page_width, page_height = _section_page_size(section, fallback=None)
+    return page_width > page_height
+
+
+def _safe_length(value, fallback):
+    return value if value is not None else fallback
+
+
+def _section_page_size(section: Section, *, fallback: Section | None) -> tuple:
+    fallback_width = fallback.page_width if fallback is not None and fallback.page_width is not None else Inches(8.27)
+    fallback_height = fallback.page_height if fallback is not None and fallback.page_height is not None else Inches(11.69)
+    return (
+        _safe_length(section.page_width, fallback_width),
+        _safe_length(section.page_height, fallback_height),
+    )
 
 
 def _copy_section_geometry(target: Section, source: Section) -> None:
-    target.orientation = WD_ORIENT.LANDSCAPE if source.page_width > source.page_height else WD_ORIENT.PORTRAIT
-    target.page_width = source.page_width
-    target.page_height = source.page_height
-    target.left_margin = source.left_margin
-    target.right_margin = source.right_margin
-    target.top_margin = source.top_margin
-    target.bottom_margin = source.bottom_margin
-    target.header_distance = source.header_distance
-    target.footer_distance = source.footer_distance
-    target.gutter = source.gutter
+    page_width, page_height = _section_page_size(source, fallback=target)
+    target.orientation = WD_ORIENT.LANDSCAPE if page_width > page_height else WD_ORIENT.PORTRAIT
+    target.page_width = page_width
+    target.page_height = page_height
+    target.left_margin = _safe_length(source.left_margin, target.left_margin or Inches(1))
+    target.right_margin = _safe_length(source.right_margin, target.right_margin or Inches(1))
+    target.top_margin = _safe_length(source.top_margin, target.top_margin or Inches(1))
+    target.bottom_margin = _safe_length(source.bottom_margin, target.bottom_margin or Inches(1))
+    target.header_distance = _safe_length(source.header_distance, target.header_distance or Inches(0.5))
+    target.footer_distance = _safe_length(source.footer_distance, target.footer_distance or Inches(0.5))
+    target.gutter = _safe_length(source.gutter, target.gutter or 0)
 
 
 def _section_geometry_matches(target: Section, source: Section) -> bool:
-    attrs = (
-        "page_width",
-        "page_height",
-        "left_margin",
-        "right_margin",
-        "top_margin",
-        "bottom_margin",
+    target_width, target_height = _section_page_size(target, fallback=None)
+    source_width, source_height = _section_page_size(source, fallback=target)
+    return (
+        target_width == source_width
+        and target_height == source_height
+        and target.left_margin == _safe_length(source.left_margin, target.left_margin)
+        and target.right_margin == _safe_length(source.right_margin, target.right_margin)
+        and target.top_margin == _safe_length(source.top_margin, target.top_margin)
+        and target.bottom_margin == _safe_length(source.bottom_margin, target.bottom_margin)
     )
-    return all(getattr(target, attr) == getattr(source, attr) for attr in attrs)
 
 
 def _ensure_section_like(doc: Document, source: Document) -> None:
@@ -84,11 +102,12 @@ def _ensure_section_like(doc: Document, source: Document) -> None:
 
 def _set_section_orientation(doc: Document, *, landscape: bool) -> None:
     section = doc.sections[-1]
-    already_landscape = section.page_width > section.page_height
+    page_width, page_height = _section_page_size(section, fallback=None)
+    already_landscape = page_width > page_height
     if already_landscape == landscape:
         return
     section.orientation = WD_ORIENT.LANDSCAPE if landscape else WD_ORIENT.PORTRAIT
-    section.page_width, section.page_height = section.page_height, section.page_width
+    section.page_width, section.page_height = page_height, page_width
 
 
 def _ensure_page_orientation(doc: Document, *, landscape: bool) -> None:
