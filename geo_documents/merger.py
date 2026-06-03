@@ -14,7 +14,7 @@ from docx.section import Section
 from docx.shared import Inches
 from docxcompose.composer import Composer
 
-from geo_documents.docx_fit import section_content_inches
+from geo_documents.docx_fit import document_ends_with_page_forcing_break, remove_empty_pages, section_content_inches
 from geo_documents.libreoffice import docx_to_pdf, find_soffice
 
 RASTER_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -290,6 +290,7 @@ def merge_to_docx_and_pdf(
 
             if ext == ".docx":
                 doc = Document(str(src_path))
+                remove_empty_pages(doc)
                 if insert_titles:
                     _prepend_heading(doc, display_name)
                 if merged is not None:
@@ -329,6 +330,7 @@ def merge_to_docx_and_pdf(
                 t.unlink(missing_ok=True)
             return warnings, errors
 
+        remove_empty_pages(merged)
         output_docx.parent.mkdir(parents=True, exist_ok=True)
         merged.save(str(output_docx))
     except Exception as e:

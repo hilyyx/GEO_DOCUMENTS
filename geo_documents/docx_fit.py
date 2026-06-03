@@ -481,12 +481,60 @@ def _is_page_break_only_paragraph(p_el) -> bool:
     )
 
 
+def _is_section_break_only_paragraph(p_el) -> bool:
+    if p_el.tag != qn("w:p") or _paragraph_has_visible_content(p_el):
+        return False
+    p_pr = p_el.find(qn("w:pPr"))
+    return p_pr is not None and p_pr.find(qn("w:sectPr")) is not None
+
+
+def _is_trailing_artifact_paragraph(p_el) -> bool:
+    return (
+        _is_empty_paragraph(p_el)
+        or _is_page_break_only_paragraph(p_el)
+        or _is_section_break_only_paragraph(p_el)
+    )
+
+
 def _content_children(body) -> list:
     return [child for child in body if child.tag != qn("w:sectPr")]
 
 
-def _remove_empty_pages(doc: Document) -> None:
-    """Убирает пустые страницы, вызванные лишними разрывами и пустыми абзацами."""
+def _strip_trailing_artifacts(body) -> None:
+    while True:
+        children = _content_children(body)
+        if not children or not _is_trailing_artifact_paragraph(children[-1]):
+            break
+        body.remove(children[-1])
+
+
+def _strip_page_break_from_last_content_paragraph(body) -> None:
+    children = _content_children(body)
+    if not children:
+        return
+    last = children[-1]
+    if last.tag != qn("w:p") or not _paragraph_has_visible_content(last):
+        return
+    if not _paragraph_has_page_break(last):
+        return
+    for br in list(last.iter(qn("w:br"))):
+        if br.get(qn("w:type")) == "page":
+            parent = br.getparent()
+            if parent is not None:
+                parent.remove(br)
+
+
+def document_ends_with_page_forcing_break(doc: Document) -> bool:
+    """True, если документ уже заканчивается разрывом страницы или секции."""
+    children = _content_children(doc.element.body)
+    if not children:
+        return False
+    last = children[-1]
+    return _is_page_break_only_paragraph(last) or _is_section_break_only_paragraph(last)
+
+
+def remove_empty_pages(doc: Document) -> None:
+    """Убирает пустые страницы: лишние разрывы, пустые абзацы, хвостовые артефакты."""
     body = doc.element.body
     seen_content = False
     previous_page_break = False
@@ -507,11 +555,8 @@ def _remove_empty_pages(doc: Document) -> None:
         seen_content = True
         previous_page_break = False
 
-    for child in reversed(_content_children(body)):
-        if _is_empty_paragraph(child):
-            body.remove(child)
-            continue
-        break
+    _strip_page_break_from_last_content_paragraph(body)
+    _strip_trailing_artifacts(body)
 
 
 def fit_document_content(doc: Document) -> None:
@@ -537,4 +582,4 @@ def fit_document_content(doc: Document) -> None:
     _normalize_floating_layout(root)
     _scale_drawings(root, img_max_w, img_max_h)
     _scale_tables(root, max_width_twips)
-    _remove_empty_pages(doc)
+    remove_empty_pages(doc)
