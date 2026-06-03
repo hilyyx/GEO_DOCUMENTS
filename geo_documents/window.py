@@ -23,7 +23,9 @@ from PyQt6.QtWidgets import (
 )
 
 from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
-from geo_documents.merger import merge_to_docx_and_pdf
+from geo_documents.merger import IMAGE_EXTS, merge_to_docx_and_pdf
+
+SUPPORTED_EXTS = (".pdf", ".docx", *sorted(IMAGE_EXTS))
 
 
 class _MergeThread(QThread):
@@ -199,7 +201,7 @@ class MainWindow(QWidget):
         found: list[Path] = []
         for name in os.listdir(self._folder):
             low = name.lower()
-            if low.endswith((".pdf", ".docx")):
+            if low.endswith(SUPPORTED_EXTS):
                 if low.startswith("~$"):
                     continue
                 found.append(self._folder / name)
@@ -246,7 +248,7 @@ class MainWindow(QWidget):
             self,
             "Добавить файлы",
             str(self._folder),
-            "Документы (*.pdf *.docx);;Все файлы (*.*)",
+            "Документы и изображения (*.pdf *.docx *.png *.jpg *.jpeg *.svg *.dvg);;Все файлы (*.*)",
         )
         if not files:
             return

@@ -10,6 +10,16 @@ _TWIPS_PER_INCH = 1440
 _DEFAULT_PAGE_WIDTH_EMU = int(8.5 * _EMU_PER_INCH)
 _DEFAULT_PAGE_HEIGHT_EMU = int(11 * _EMU_PER_INCH)
 _DEFAULT_MARGIN_EMU = int(1 * _EMU_PER_INCH)
+_ANCHOR_POSITION_TAGS = {
+    qn("wp:simplePos"),
+    qn("wp:positionH"),
+    qn("wp:positionV"),
+    qn("wp:wrapNone"),
+    qn("wp:wrapSquare"),
+    qn("wp:wrapTight"),
+    qn("wp:wrapThrough"),
+    qn("wp:wrapTopAndBottom"),
+}
 
 
 def _section_content_emu(section: Section) -> tuple[int, int]:
@@ -66,6 +76,26 @@ def _scale_drawings(root, max_cx: int, max_cy: int) -> None:
                 for pic_extent in drawing.iter(qn("a:ext")):
                     _scale_int_attr(pic_extent, cx_attr, scale)
                     _scale_int_attr(pic_extent, cy_attr, scale)
+
+
+def _normalize_floating_layout(root) -> None:
+    """Переводит плавающие объекты в поток, чтобы они не накладывались на текст/таблицы."""
+    for tbl_pr in root.iter(qn("w:tblPr")):
+        for tblp_pr in list(tbl_pr.findall(qn("w:tblpPr"))):
+            tbl_pr.remove(tblp_pr)
+
+    for p_pr in root.iter(qn("w:pPr")):
+        for frame_pr in list(p_pr.findall(qn("w:framePr"))):
+            p_pr.remove(frame_pr)
+
+    for anchor in list(root.iter(qn("wp:anchor"))):
+        for child in list(anchor):
+            if child.tag in _ANCHOR_POSITION_TAGS:
+                anchor.remove(child)
+        for attr in list(anchor.attrib):
+            if attr not in {"distT", "distB", "distL", "distR"}:
+                del anchor.attrib[attr]
+        anchor.tag = qn("wp:inline")
 
 
 def _table_width_twips(tbl_el, *, content_width_twips: int) -> int | None:
@@ -133,6 +163,71 @@ def _scale_tables(root, max_width_twips: int) -> None:
         _scale_table_columns(tbl_el, scale)
 
 
+def _paragraph_has_visible_content(p_el) -> bool:
+    for text_el in p_el.iter(qn("w:t")):
+        if text_el.text and text_el.text.strip():
+            return True
+    visible_tags = {
+        qn("w:drawing"),
+        qn("w:pict"),
+        qn("w:object"),
+        qn("w:tbl"),
+    }
+    return any(el.tag in visible_tags for el in p_el.iter())
+
+
+def _paragraph_has_page_break(p_el) -> bool:
+    for br in p_el.iter(qn("w:br")):
+        if br.get(qn("w:type")) == "page":
+            return True
+    return False
+
+
+def _is_empty_paragraph(p_el) -> bool:
+    return p_el.tag == qn("w:p") and not _paragraph_has_visible_content(p_el)
+
+
+def _is_page_break_only_paragraph(p_el) -> bool:
+    return (
+        p_el.tag == qn("w:p")
+        and _paragraph_has_page_break(p_el)
+        and not _paragraph_has_visible_content(p_el)
+    )
+
+
+def _content_children(body) -> list:
+    return [child for child in body if child.tag != qn("w:sectPr")]
+
+
+def _remove_empty_pages(doc: Document) -> None:
+    """Убирает пустые страницы, вызванные лишними разрывами и пустыми абзацами."""
+    body = doc.element.body
+    seen_content = False
+    previous_page_break = False
+
+    for child in list(_content_children(body)):
+        if _is_page_break_only_paragraph(child):
+            if not seen_content or previous_page_break:
+                body.remove(child)
+                continue
+            previous_page_break = True
+            continue
+
+        if _is_empty_paragraph(child):
+            if not seen_content or previous_page_break:
+                body.remove(child)
+            continue
+
+        seen_content = True
+        previous_page_break = False
+
+    for child in reversed(_content_children(body)):
+        if _is_empty_paragraph(child):
+            body.remove(child)
+            continue
+        break
+
+
 def fit_document_content(doc: Document) -> None:
     """Уменьшает слишком широкие таблицы и рисунки под поля секций документа."""
     if not doc.sections:
@@ -150,5 +245,7 @@ def fit_document_content(doc: Document) -> None:
     max_width_twips = int(tbl_max_w / _EMU_PER_INCH * _TWIPS_PER_INCH)
 
     root = doc.element.body
+    _normalize_floating_layout(root)
     _scale_drawings(root, img_max_w, img_max_h)
     _scale_tables(root, max_width_twips)
+    _remove_empty_pages(doc)

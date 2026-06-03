@@ -8,11 +8,16 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from docx import Document
 from docx.enum.text import WD_BREAK
+from docx.image.image import Image as DocxImage
 from docx.shared import Inches
 from docxcompose.composer import Composer
 
 from geo_documents.docx_fit import fit_document_content, section_content_inches
 from geo_documents.libreoffice import docx_to_pdf, find_soffice
+
+RASTER_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+VECTOR_IMAGE_EXTS = {".svg", ".dvg"}
+IMAGE_EXTS = RASTER_IMAGE_EXTS | VECTOR_IMAGE_EXTS
 
 
 def _prepend_heading(doc: Document, text: str) -> None:
@@ -99,6 +104,59 @@ def _append_pdf_as_images(
         src.close()
 
 
+def _append_raster_image(doc: Document, image_path: Path) -> None:
+    max_w_in, max_h_in = _pdf_content_inches(doc)
+    image = DocxImage.from_file(str(image_path))
+    horz_dpi = image.horz_dpi or 72
+    vert_dpi = image.vert_dpi or horz_dpi
+    w_in = image.px_width / horz_dpi
+    h_in = image.px_height / vert_dpi
+    if w_in <= 0 or h_in <= 0:
+        w_in, h_in = max_w_in, max_h_in
+    scale = min(max_w_in / w_in, max_h_in / h_in, 1.0)
+
+    par = doc.add_paragraph()
+    run = par.add_run()
+    run.add_picture(str(image_path), width=Inches(w_in * scale), height=Inches(h_in * scale))
+
+
+def _append_vector_image(doc: Document, image_path: Path, *, dpi: int) -> None:
+    max_w_in, max_h_in = _pdf_content_inches(doc)
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    data = image_path.read_bytes()
+    src = fitz.open(stream=data, filetype="svg")
+    try:
+        if len(src) == 0:
+            raise ValueError("векторное изображение не содержит страниц")
+        page = src[0]
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        w_in, h_in = _fit_picture_inches(
+            pix.width,
+            pix.height,
+            dpi=dpi,
+            max_width_inches=max_w_in,
+            max_height_inches=max_h_in,
+        )
+        bio = io.BytesIO(pix.tobytes("png"))
+        bio.seek(0)
+        par = doc.add_paragraph()
+        run = par.add_run()
+        run.add_picture(bio, width=Inches(w_in), height=Inches(h_in))
+    finally:
+        src.close()
+
+
+def _append_image(doc: Document, image_path: Path, *, dpi: int) -> None:
+    ext = image_path.suffix.lower()
+    if ext in RASTER_IMAGE_EXTS:
+        _append_raster_image(doc, image_path)
+        return
+    if ext in VECTOR_IMAGE_EXTS:
+        _append_vector_image(doc, image_path, dpi=dpi)
+        return
+    raise ValueError(f"неподдерживаемый формат изображения: {image_path.suffix}")
+
+
 def merge_to_docx_and_pdf(
     paths: list[Path],
     output_docx: Path,
@@ -118,6 +176,7 @@ def merge_to_docx_and_pdf(
     soffice = find_soffice(preferred=libreoffice_executable)
 
     work_items: list[tuple[Path, str]] = []
+    image_items: list[tuple[Path, str]] = []
     temp_to_delete: list[Path] = []
 
     for p in paths:
@@ -135,9 +194,12 @@ def merge_to_docx_and_pdf(
         if ext == ".pdf":
             work_items.append((p, p.name))
             continue
+        if ext in IMAGE_EXTS:
+            image_items.append((p, p.name))
+            continue
         warnings.append(f"Пропуск (неподдерживаемый тип): {p.name}")
 
-    if not work_items:
+    if not work_items and not image_items:
         errors.append("Нет ни одного поддерживаемого файла для склейки (.doc пропускаются).")
         return warnings, errors
 
@@ -174,6 +236,19 @@ def merge_to_docx_and_pdf(
                         composer = Composer(merged)
                     composer.append(doc)
                 continue
+
+        for src_path, display_name in image_items:
+            if merged is None:
+                merged = Document()
+                composer = None
+            elif page_break_between_parts:
+                _append_page_break(merged)
+            if insert_titles:
+                merged.add_heading(display_name, level=2)
+            try:
+                _append_image(merged, src_path, dpi=pdf_render_dpi)
+            except Exception as e:
+                warnings.append(f"Изображение не вставлено ({src_path.name}): {e}")
 
         if merged is None:
             errors.append("Не удалось сформировать документ (неизвестная причина).")
