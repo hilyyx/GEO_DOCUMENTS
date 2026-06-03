@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.section import Section
 _EMU_PER_INCH = 914400
@@ -20,6 +21,7 @@ _ANCHOR_POSITION_TAGS = {
     qn("wp:wrapThrough"),
     qn("wp:wrapTopAndBottom"),
 }
+_SIGNATURE_MARKER = "составил"
 
 
 def _section_content_emu(section: Section) -> tuple[int, int]:
@@ -96,6 +98,136 @@ def _normalize_floating_layout(root) -> None:
             if attr not in {"distT", "distB", "distL", "distR"}:
                 del anchor.attrib[attr]
         anchor.tag = qn("wp:inline")
+
+
+def _element_text(el) -> str:
+    return "".join(text_el.text or "" for text_el in el.iter(qn("w:t")))
+
+
+def _is_signature_marker_paragraph(p_el) -> bool:
+    text = " ".join(_element_text(p_el).lower().split())
+    return _SIGNATURE_MARKER in text and ":" in text
+
+
+def _run_has_drawing(run_el) -> bool:
+    drawing_tags = {qn("w:drawing"), qn("w:pict"), qn("w:object")}
+    return any(el.tag in drawing_tags for el in run_el.iter())
+
+
+def _drawing_runs(p_el) -> list:
+    return [run_el for run_el in p_el.findall(qn("w:r")) if _run_has_drawing(run_el)]
+
+
+def _paragraph_has_text(p_el) -> bool:
+    return bool(_element_text(p_el).strip())
+
+
+def _is_slash_name_paragraph(p_el) -> bool:
+    text = " ".join(_element_text(p_el).split())
+    return 3 <= len(text) <= 80 and text.startswith("/") and text.endswith("/")
+
+
+def _append_tab_run(p_el) -> None:
+    run = OxmlElement("w:r")
+    tab = OxmlElement("w:tab")
+    run.append(tab)
+    p_el.append(run)
+
+
+def _move_signature_runs(target_p, source_p, body) -> bool:
+    runs = _drawing_runs(source_p)
+    if not runs:
+        return False
+    _append_tab_run(target_p)
+    for run in runs:
+        target_p.append(run)
+    if _is_empty_paragraph(source_p):
+        body.remove(source_p)
+    return True
+
+
+def _move_slash_name_to_signature_line(target_p, source_p, body) -> bool:
+    if not _is_slash_name_paragraph(source_p):
+        return False
+    _append_tab_run(target_p)
+    for run in list(source_p.findall(qn("w:r"))):
+        target_p.append(run)
+    if _is_empty_paragraph(source_p):
+        body.remove(source_p)
+    return True
+
+
+def _place_signatures_next_to_marker(doc: Document) -> None:
+    """Ставит картинку-подпись справа от строки вида "Составил: ...".
+
+    В шаблонах подпись часто хранится отдельным плавающим рисунком рядом со строкой
+    исполнителя. После слияния такой рисунок может оказаться поверх таблицы, поэтому
+    переносим ближайший рисунок в сам абзац "Составил:".
+    """
+    body = doc.element.body
+    children = _content_children(body)
+
+    for idx, child in enumerate(list(children)):
+        if child.tag != qn("w:p") or not _is_signature_marker_paragraph(child):
+            continue
+        if _drawing_runs(child):
+            continue
+
+        moved = False
+        for prev_idx in range(idx - 1, max(-1, idx - 4), -1):
+            candidate = children[prev_idx]
+            if candidate.tag == qn("w:tbl"):
+                continue
+            if candidate.tag == qn("w:p"):
+                if _move_signature_runs(child, candidate, body):
+                    moved = True
+                    break
+                if _paragraph_has_text(candidate):
+                    break
+                continue
+            break
+
+        if not moved:
+            for next_idx in range(idx + 1, min(len(children), idx + 5)):
+                candidate = children[next_idx]
+                if candidate.tag != qn("w:p"):
+                    break
+                if _move_signature_runs(child, candidate, body):
+                    following_idx = next_idx + 1
+                    if following_idx < len(children):
+                        _move_slash_name_to_signature_line(child, children[following_idx], body)
+                    break
+                if _paragraph_has_text(candidate):
+                    break
+
+
+def _move_signature_blocks_under_tables(doc: Document) -> None:
+    """Если строка "Составил:" стоит перед таблицей, переносит её сразу под таблицу."""
+    body = doc.element.body
+
+    for child in list(_content_children(body)):
+        if child.tag != qn("w:p") or not _is_signature_marker_paragraph(child):
+            continue
+
+        children = _content_children(body)
+        try:
+            idx = children.index(child)
+        except ValueError:
+            continue
+
+        target_table = None
+        for next_idx in range(idx + 1, min(len(children), idx + 8)):
+            candidate = children[next_idx]
+            if candidate.tag == qn("w:tbl"):
+                target_table = candidate
+                continue
+            if candidate.tag == qn("w:p") and _is_empty_paragraph(candidate):
+                continue
+            break
+
+        if target_table is not None:
+            body.remove(child)
+            target_table.addnext(child)
 
 
 def _table_width_twips(tbl_el, *, content_width_twips: int) -> int | None:
@@ -245,6 +377,8 @@ def fit_document_content(doc: Document) -> None:
     max_width_twips = int(tbl_max_w / _EMU_PER_INCH * _TWIPS_PER_INCH)
 
     root = doc.element.body
+    _place_signatures_next_to_marker(doc)
+    _move_signature_blocks_under_tables(doc)
     _normalize_floating_layout(root)
     _scale_drawings(root, img_max_w, img_max_h)
     _scale_tables(root, max_width_twips)
