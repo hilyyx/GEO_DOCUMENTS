@@ -7,12 +7,14 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 from docx import Document
+from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.text import WD_BREAK
 from docx.image.image import Image as DocxImage
+from docx.section import Section
 from docx.shared import Inches
 from docxcompose.composer import Composer
 
-from geo_documents.docx_fit import fit_document_content, section_content_inches
+from geo_documents.docx_fit import section_content_inches
 from geo_documents.libreoffice import docx_to_pdf, find_soffice
 
 RASTER_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -33,17 +35,77 @@ def _append_page_break(doc: Document) -> None:
     p.add_run().add_break(WD_BREAK.PAGE)
 
 
+def _has_body_content(doc: Document) -> bool:
+    return any(child.tag.rsplit("}", 1)[-1] != "sectPr" for child in doc.element.body)
+
+
+def _section_is_landscape(doc: Document) -> bool:
+    section = doc.sections[-1]
+    return section.page_width > section.page_height
+
+
+def _copy_section_geometry(target: Section, source: Section) -> None:
+    target.orientation = WD_ORIENT.LANDSCAPE if source.page_width > source.page_height else WD_ORIENT.PORTRAIT
+    target.page_width = source.page_width
+    target.page_height = source.page_height
+    target.left_margin = source.left_margin
+    target.right_margin = source.right_margin
+    target.top_margin = source.top_margin
+    target.bottom_margin = source.bottom_margin
+    target.header_distance = source.header_distance
+    target.footer_distance = source.footer_distance
+    target.gutter = source.gutter
+
+
+def _section_geometry_matches(target: Section, source: Section) -> bool:
+    attrs = (
+        "page_width",
+        "page_height",
+        "left_margin",
+        "right_margin",
+        "top_margin",
+        "bottom_margin",
+    )
+    return all(getattr(target, attr) == getattr(source, attr) for attr in attrs)
+
+
+def _ensure_section_like(doc: Document, source: Document) -> None:
+    if not source.sections:
+        return
+    source_section = source.sections[0]
+    if not _has_body_content(doc):
+        _copy_section_geometry(doc.sections[-1], source_section)
+        return
+    if _section_geometry_matches(doc.sections[-1], source_section):
+        return
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    _copy_section_geometry(doc.sections[-1], source_section)
+
+
+def _set_section_orientation(doc: Document, *, landscape: bool) -> None:
+    section = doc.sections[-1]
+    already_landscape = section.page_width > section.page_height
+    if already_landscape == landscape:
+        return
+    section.orientation = WD_ORIENT.LANDSCAPE if landscape else WD_ORIENT.PORTRAIT
+    section.page_width, section.page_height = section.page_height, section.page_width
+
+
+def _ensure_page_orientation(doc: Document, *, landscape: bool) -> None:
+    if not _has_body_content(doc):
+        _set_section_orientation(doc, landscape=landscape)
+        return
+    if _section_is_landscape(doc) == landscape:
+        return
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    _set_section_orientation(doc, landscape=landscape)
+
+
 def _pdf_content_inches(doc: Document) -> tuple[float, float]:
-    """Минимальная область печати — PDF-страницы вставляются на любую секцию."""
-    widths: list[float] = []
-    heights: list[float] = []
-    for section in doc.sections:
-        w, h = section_content_inches(section)
-        widths.append(w)
-        heights.append(h)
-    if not widths:
+    """Область печати текущей секции."""
+    if not doc.sections:
         return 6.0, 9.0
-    return min(widths), min(heights)
+    return section_content_inches(doc.sections[-1])
 
 
 def _fit_picture_inches(
@@ -87,6 +149,8 @@ def _append_pdf_as_images(
     try:
         for i in range(len(src)):
             page = src[i]
+            _ensure_page_orientation(doc, landscape=page.rect.width > page.rect.height)
+            max_w_in, max_h_in = _pdf_content_inches(doc)
             pix = page.get_pixmap(matrix=matrix, clip=_pdf_render_rect(page), alpha=False)
             w_in, h_in = _fit_picture_inches(
                 pix.width,
@@ -105,12 +169,13 @@ def _append_pdf_as_images(
 
 
 def _append_raster_image(doc: Document, image_path: Path) -> None:
-    max_w_in, max_h_in = _pdf_content_inches(doc)
     image = DocxImage.from_file(str(image_path))
     horz_dpi = image.horz_dpi or 72
     vert_dpi = image.vert_dpi or horz_dpi
     w_in = image.px_width / horz_dpi
     h_in = image.px_height / vert_dpi
+    _ensure_page_orientation(doc, landscape=w_in > h_in)
+    max_w_in, max_h_in = _pdf_content_inches(doc)
     if w_in <= 0 or h_in <= 0:
         w_in, h_in = max_w_in, max_h_in
     scale = min(max_w_in / w_in, max_h_in / h_in, 1.0)
@@ -121,7 +186,6 @@ def _append_raster_image(doc: Document, image_path: Path) -> None:
 
 
 def _append_vector_image(doc: Document, image_path: Path, *, dpi: int) -> None:
-    max_w_in, max_h_in = _pdf_content_inches(doc)
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     data = image_path.read_bytes()
     src = fitz.open(stream=data, filetype="svg")
@@ -130,6 +194,8 @@ def _append_vector_image(doc: Document, image_path: Path, *, dpi: int) -> None:
             raise ValueError("векторное изображение не содержит страниц")
         page = src[0]
         pix = page.get_pixmap(matrix=matrix, alpha=False)
+        _ensure_page_orientation(doc, landscape=pix.width > pix.height)
+        max_w_in, max_h_in = _pdf_content_inches(doc)
         w_in, h_in = _fit_picture_inches(
             pix.width,
             pix.height,
@@ -211,13 +277,12 @@ def merge_to_docx_and_pdf(
         for idx, (src_path, display_name) in enumerate(work_items):
             ext = src_path.suffix.lower()
 
-            if idx > 0 and page_break_between_parts and merged is not None:
-                _append_page_break(merged)
-
             if ext == ".pdf":
                 if merged is None:
                     merged = Document()
                     composer = None
+                elif page_break_between_parts:
+                    _append_page_break(merged)
                 if insert_titles:
                     merged.add_heading(display_name, level=2)
                 _append_pdf_as_images(merged, src_path, dpi=pdf_render_dpi)
@@ -225,9 +290,17 @@ def merge_to_docx_and_pdf(
 
             if ext == ".docx":
                 doc = Document(str(src_path))
-                fit_document_content(doc)
                 if insert_titles:
                     _prepend_heading(doc, display_name)
+                if merged is not None:
+                    if (
+                        page_break_between_parts
+                        and doc.sections
+                        and _section_geometry_matches(merged.sections[-1], doc.sections[0])
+                    ):
+                        _append_page_break(merged)
+                    else:
+                        _ensure_section_like(merged, doc)
                 if merged is None:
                     merged = doc
                     composer = Composer(merged)
@@ -257,7 +330,6 @@ def merge_to_docx_and_pdf(
             return warnings, errors
 
         output_docx.parent.mkdir(parents=True, exist_ok=True)
-        fit_document_content(merged)
         merged.save(str(output_docx))
     except Exception as e:
         errors.append(f"Ошибка при склейке или сохранении DOCX: {e}\n{traceback.format_exc()}")

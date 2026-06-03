@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.section import Section
@@ -11,6 +12,10 @@ _TWIPS_PER_INCH = 1440
 _DEFAULT_PAGE_WIDTH_EMU = int(8.5 * _EMU_PER_INCH)
 _DEFAULT_PAGE_HEIGHT_EMU = int(11 * _EMU_PER_INCH)
 _DEFAULT_MARGIN_EMU = int(1 * _EMU_PER_INCH)
+_TABLE_SAFE_WIDTH_RATIO = 0.98
+_DRAWING_TABLE_IND_TWIPS = 108
+_GRAPH_TABLE_COLS_TWIPS = (5478, 4777)
+_LANDSCAPE_TABLE_THRESHOLD = 1.02
 _ANCHOR_POSITION_TAGS = {
     qn("wp:simplePos"),
     qn("wp:positionH"),
@@ -39,6 +44,15 @@ def _section_content_emu(section: Section) -> tuple[int, int]:
     if h <= 0:
         h = _DEFAULT_PAGE_HEIGHT_EMU - 2 * _DEFAULT_MARGIN_EMU
     return int(w), int(h)
+
+
+def _set_section_landscape(section: Section) -> None:
+    if not section.page_width or not section.page_height:
+        return
+    if section.page_width > section.page_height:
+        return
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
 
 
 def section_content_inches(section: Section) -> tuple[float, float]:
@@ -78,6 +92,18 @@ def _scale_drawings(root, max_cx: int, max_cy: int) -> None:
                 for pic_extent in drawing.iter(qn("a:ext")):
                     _scale_int_attr(pic_extent, cx_attr, scale)
                     _scale_int_attr(pic_extent, cy_attr, scale)
+
+
+def _scale_drawing_extents(root, scale: float) -> None:
+    for tag in (qn("wp:inline"), qn("wp:anchor")):
+        for drawing in root.iter(tag):
+            extent = drawing.find(qn("wp:extent"))
+            if extent is not None:
+                _scale_int_attr(extent, "cx", scale)
+                _scale_int_attr(extent, "cy", scale)
+            for pic_extent in drawing.iter(qn("a:ext")):
+                _scale_int_attr(pic_extent, "cx", scale)
+                _scale_int_attr(pic_extent, "cy", scale)
 
 
 def _normalize_floating_layout(root) -> None:
@@ -286,13 +312,141 @@ def _scale_table_columns(tbl_el, scale: float) -> None:
             _scale_int_attr(tbl_w, qn("w:w"), scale)
 
 
+def _remove_children(parent, child_tag: str) -> None:
+    for child in list(parent.findall(child_tag)):
+        parent.remove(child)
+
+
+def _table_has_drawings(tbl_el) -> bool:
+    return any(
+        True
+        for _ in (
+            list(tbl_el.iter(qn("w:drawing")))
+            + list(tbl_el.iter(qn("w:pict")))
+            + list(tbl_el.iter(qn("w:object")))
+        )
+    )
+
+
+def _is_graph_table(tbl_el) -> bool:
+    text = " ".join(_element_text(tbl_el).lower().split())
+    drawings = sum(1 for _ in tbl_el.iter(qn("w:drawing"))) + sum(
+        1 for _ in tbl_el.iter(qn("w:pict"))
+    )
+    return drawings >= 2 and (
+        "консолидированно" in text or "график зависимости" in text
+    )
+
+
+def _set_graph_table_reference_geometry(tbl_el) -> None:
+    grid = tbl_el.find(qn("w:tblGrid"))
+    if grid is not None:
+        cols = grid.findall(qn("w:gridCol"))
+        if len(cols) == len(_GRAPH_TABLE_COLS_TWIPS):
+            for col, width in zip(cols, _GRAPH_TABLE_COLS_TWIPS):
+                col.set(qn("w:w"), str(width))
+
+    first_row = tbl_el.find(qn("w:tr"))
+    if first_row is None:
+        return
+    cells = first_row.findall(qn("w:tc"))
+    if len(cells) != len(_GRAPH_TABLE_COLS_TWIPS):
+        return
+    for cell, width in zip(cells, _GRAPH_TABLE_COLS_TWIPS):
+        tc_pr = cell.find(qn("w:tcPr"))
+        if tc_pr is None:
+            continue
+        tc_w = tc_pr.find(qn("w:tcW"))
+        if tc_w is not None:
+            tc_w.set(qn("w:type"), "dxa")
+            tc_w.set(qn("w:w"), str(width))
+
+
+def _normalize_table_readability(tbl_el, max_width_twips: int) -> None:
+    has_drawings = _table_has_drawings(tbl_el)
+    tbl_pr = tbl_el.find(qn("w:tblPr"))
+    if tbl_pr is None:
+        tbl_pr = OxmlElement("w:tblPr")
+        tbl_el.insert(0, tbl_pr)
+
+    if has_drawings:
+        tbl_ind = tbl_pr.find(qn("w:tblInd"))
+        if tbl_ind is None:
+            tbl_ind = OxmlElement("w:tblInd")
+            tbl_pr.append(tbl_ind)
+        tbl_ind.set(qn("w:type"), "dxa")
+        tbl_ind.set(qn("w:w"), str(_DRAWING_TABLE_IND_TWIPS))
+    else:
+        # Отступ таблицы часто даёт визуальную обрезку справа/слева после экспорта в PDF.
+        _remove_children(tbl_pr, qn("w:tblInd"))
+
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    if has_drawings:
+        tbl_w.set(qn("w:type"), "auto")
+        tbl_w.set(qn("w:w"), "0")
+    else:
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_w.set(qn("w:w"), str(max_width_twips))
+
+    tbl_layout = tbl_pr.find(qn("w:tblLayout"))
+    if tbl_layout is None:
+        tbl_layout = OxmlElement("w:tblLayout")
+        tbl_pr.append(tbl_layout)
+    tbl_layout.set(qn("w:type"), "fixed" if has_drawings else "autofit")
+
+    for tr in tbl_el.iter(qn("w:tr")):
+        tr_pr = tr.find(qn("w:trPr"))
+        if tr_pr is None:
+            continue
+        for tr_height in tr_pr.findall(qn("w:trHeight")):
+            # "exact" режет многострочные/повёрнутые подписи в ячейках.
+            if tr_height.get(qn("w:hRule")) == "exact":
+                tr_height.set(qn("w:hRule"), "atLeast")
+
+    for tc_pr in tbl_el.iter(qn("w:tcPr")):
+        _remove_children(tc_pr, qn("w:noWrap"))
+
+
 def _scale_tables(root, max_width_twips: int) -> None:
     for tbl_el in root.iter(qn("w:tbl")):
+        _normalize_table_readability(tbl_el, max_width_twips)
+        if _is_graph_table(tbl_el):
+            _set_graph_table_reference_geometry(tbl_el)
+            continue
+        if _table_has_drawings(tbl_el):
+            continue
         width = _table_width_twips(tbl_el, content_width_twips=max_width_twips)
-        if width is None or width <= max_width_twips:
+        if width is None:
+            continue
+        if width <= max_width_twips:
             continue
         scale = max_width_twips / width
         _scale_table_columns(tbl_el, scale)
+
+
+def _make_wide_table_sections_landscape(doc: Document) -> None:
+    if not doc.sections:
+        return
+
+    content_widths = [_section_content_emu(section)[0] for section in doc.sections]
+    if not content_widths:
+        return
+    max_current_width_twips = int(max(content_widths) / _EMU_PER_INCH * _TWIPS_PER_INCH)
+
+    widest_table = 0
+    for tbl_el in doc.element.body.iter(qn("w:tbl")):
+        width = _table_width_twips(tbl_el, content_width_twips=max_current_width_twips)
+        if width is not None:
+            widest_table = max(widest_table, width)
+
+    if widest_table <= max_current_width_twips * _LANDSCAPE_TABLE_THRESHOLD:
+        return
+
+    for section in doc.sections:
+        _set_section_landscape(section)
 
 
 def _paragraph_has_visible_content(p_el) -> bool:
@@ -364,17 +518,18 @@ def fit_document_content(doc: Document) -> None:
     """Уменьшает слишком широкие таблицы и рисунки под поля секций документа."""
     if not doc.sections:
         return
+    _make_wide_table_sections_landscape(doc)
     widths: list[int] = []
     heights: list[int] = []
     for section in doc.sections:
         w, h = _section_content_emu(section)
         widths.append(w)
         heights.append(h)
-    # Рисунки должны помещаться и в портрет, и в альбомную секцию.
-    img_max_w, img_max_h = min(widths), min(heights)
-    # Таблицы в альбомной ориентации могут быть шире — берём максимальную ширину поля.
+    # Сохраняем доступную ширину альбомных секций: широкие листы не должны
+    # принудительно ужиматься под портретную страницу.
+    img_max_w, img_max_h = max(widths), max(heights)
     tbl_max_w = max(widths)
-    max_width_twips = int(tbl_max_w / _EMU_PER_INCH * _TWIPS_PER_INCH)
+    max_width_twips = int(tbl_max_w / _EMU_PER_INCH * _TWIPS_PER_INCH * _TABLE_SAFE_WIDTH_RATIO)
 
     root = doc.element.body
     _place_signatures_next_to_marker(doc)
