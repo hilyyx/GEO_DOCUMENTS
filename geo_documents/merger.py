@@ -11,6 +11,7 @@ from docx.enum.text import WD_BREAK
 from docx.shared import Inches
 from docxcompose.composer import Composer
 
+from geo_documents.docx_fit import fit_document_content, section_content_inches
 from geo_documents.libreoffice import docx_to_pdf, find_soffice
 
 
@@ -27,23 +28,73 @@ def _append_page_break(doc: Document) -> None:
     p.add_run().add_break(WD_BREAK.PAGE)
 
 
+def _pdf_content_inches(doc: Document) -> tuple[float, float]:
+    """Минимальная область печати — PDF-страницы вставляются на любую секцию."""
+    widths: list[float] = []
+    heights: list[float] = []
+    for section in doc.sections:
+        w, h = section_content_inches(section)
+        widths.append(w)
+        heights.append(h)
+    if not widths:
+        return 6.0, 9.0
+    return min(widths), min(heights)
+
+
+def _fit_picture_inches(
+    width_px: int,
+    height_px: int,
+    *,
+    dpi: int,
+    max_width_inches: float,
+    max_height_inches: float,
+) -> tuple[float, float]:
+    w_in = width_px / dpi
+    h_in = height_px / dpi
+    if w_in <= 0 or h_in <= 0:
+        return max_width_inches, max_height_inches
+    scale = min(max_width_inches / w_in, max_height_inches / h_in, 1.0)
+    return w_in * scale, h_in * scale
+
+
+def _pdf_render_rect(page: fitz.Page) -> fitz.Rect:
+    """Область рендера PDF: не обрезать контент из-за узкого CropBox."""
+    rect = page.rect | page.mediabox
+    try:
+        bound = page.bound()
+        if bound.width > 0 and bound.height > 0:
+            rect |= bound
+    except Exception:
+        pass
+    return rect
+
+
 def _append_pdf_as_images(
     doc: Document,
     pdf_path: Path,
     *,
     dpi: int = 120,
-    max_width_inches: float = 6.5,
 ) -> None:
+    max_w_in, max_h_in = _pdf_content_inches(doc)
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+
     src = fitz.open(pdf_path)
     try:
         for i in range(len(src)):
             page = src[i]
-            pix = page.get_pixmap(dpi=dpi)
+            pix = page.get_pixmap(matrix=matrix, clip=_pdf_render_rect(page), alpha=False)
+            w_in, h_in = _fit_picture_inches(
+                pix.width,
+                pix.height,
+                dpi=dpi,
+                max_width_inches=max_w_in,
+                max_height_inches=max_h_in,
+            )
             bio = io.BytesIO(pix.tobytes("png"))
             bio.seek(0)
             par = doc.add_paragraph()
             run = par.add_run()
-            run.add_picture(bio, width=Inches(max_width_inches))
+            run.add_picture(bio, width=Inches(w_in), height=Inches(h_in))
     finally:
         src.close()
 
@@ -112,6 +163,7 @@ def merge_to_docx_and_pdf(
 
             if ext == ".docx":
                 doc = Document(str(src_path))
+                fit_document_content(doc)
                 if insert_titles:
                     _prepend_heading(doc, display_name)
                 if merged is None:
@@ -130,6 +182,7 @@ def merge_to_docx_and_pdf(
             return warnings, errors
 
         output_docx.parent.mkdir(parents=True, exist_ok=True)
+        fit_document_content(merged)
         merged.save(str(output_docx))
     except Exception as e:
         errors.append(f"Ошибка при склейке или сохранении DOCX: {e}\n{traceback.format_exc()}")
