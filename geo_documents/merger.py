@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import io
 import shutil
+import tempfile
 import traceback
+import zipfile
+from xml.etree import ElementTree
 from pathlib import Path
 
 import fitz  # PyMuPDF
 from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
-from docx.enum.text import WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.image.image import Image as DocxImage
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.section import Section
 from docx.shared import Inches
 from docxcompose.composer import Composer
@@ -20,6 +25,175 @@ from geo_documents.libreoffice import docx_to_pdf, find_soffice
 RASTER_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 VECTOR_IMAGE_EXTS = {".svg", ".dvg"}
 IMAGE_EXTS = RASTER_IMAGE_EXTS | VECTOR_IMAGE_EXTS
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+_APP_PROPS_NS = {"ep": "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"}
+
+
+def _set_update_fields_on_open(doc: Document) -> None:
+    settings = doc.settings.element
+    update_fields = settings.find(qn("w:updateFields"))
+    if update_fields is None:
+        update_fields = OxmlElement("w:updateFields")
+        settings.append(update_fields)
+    update_fields.set(qn("w:val"), "true")
+
+
+def _field_char(kind: str):
+    run = OxmlElement("w:r")
+    fld_char = OxmlElement("w:fldChar")
+    fld_char.set(qn("w:fldCharType"), kind)
+    run.append(fld_char)
+    return run
+
+
+def _field_instruction(text: str):
+    run = OxmlElement("w:r")
+    instr = OxmlElement("w:instrText")
+    instr.set(_XML_SPACE, "preserve")
+    instr.text = text
+    run.append(instr)
+    return run
+
+
+def _field_cached_text(text: str):
+    run = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = text
+    run.append(t)
+    return run
+
+
+def _clear_paragraph(paragraph) -> None:
+    for child in list(paragraph._p):
+        paragraph._p.remove(child)
+
+
+def _numbering_paragraph(container):
+    paragraph = container.paragraphs[0] if container.paragraphs and not container.paragraphs[0].text else container.add_paragraph()
+    _clear_paragraph(paragraph)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    return paragraph
+
+
+def _add_page_field(paragraph, *, fallback: str = "1") -> None:
+    paragraph._p.append(_field_char("begin"))
+    paragraph._p.append(_field_instruction(" PAGE "))
+    paragraph._p.append(_field_char("separate"))
+    paragraph._p.append(_field_cached_text(fallback))
+    paragraph._p.append(_field_char("end"))
+
+
+def _add_global_page_field(paragraph, *, offset: int) -> None:
+    if offset <= 0:
+        _add_page_field(paragraph)
+        return
+
+    paragraph._p.append(_field_char("begin"))
+    paragraph._p.append(_field_instruction(" = "))
+    paragraph._p.append(_field_char("begin"))
+    paragraph._p.append(_field_instruction(" PAGE "))
+    paragraph._p.append(_field_char("separate"))
+    paragraph._p.append(_field_cached_text("1"))
+    paragraph._p.append(_field_char("end"))
+    paragraph._p.append(_field_instruction(f" + {offset} "))
+    paragraph._p.append(_field_char("separate"))
+    paragraph._p.append(_field_cached_text(str(offset + 1)))
+    paragraph._p.append(_field_char("end"))
+
+
+def _set_section_page_restart(section: Section, *, start: int | None) -> None:
+    sect_pr = section._sectPr
+    for existing in list(sect_pr.findall(qn("w:pgNumType"))):
+        sect_pr.remove(existing)
+    if start is None:
+        return
+    pg_num_type = OxmlElement("w:pgNumType")
+    pg_num_type.set(qn("w:start"), str(start))
+    sect_pr.append(pg_num_type)
+
+
+def _apply_section_numbering(section: Section, *, global_offset: int, restart_local: bool) -> None:
+    section.header.is_linked_to_previous = False
+    section.footer.is_linked_to_previous = False
+    _set_section_page_restart(section, start=1 if restart_local else None)
+
+    header_paragraph = _numbering_paragraph(section.header)
+    _add_global_page_field(header_paragraph, offset=global_offset)
+
+    footer_paragraph = _numbering_paragraph(section.footer)
+    _add_page_field(footer_paragraph)
+
+
+def _apply_page_numbering(doc: Document, part_sections: list[tuple[int, int, int]]) -> None:
+    if not doc.sections:
+        return
+    _set_update_fields_on_open(doc)
+    for start_idx, end_idx, global_offset in part_sections:
+        for idx in range(start_idx, min(end_idx, len(doc.sections) - 1) + 1):
+            _apply_section_numbering(
+                doc.sections[idx],
+                global_offset=global_offset,
+                restart_local=idx == start_idx,
+            )
+
+
+def _docx_extended_page_count(path: Path) -> int | None:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            with zf.open("docProps/app.xml") as app_xml:
+                root = ElementTree.parse(app_xml).getroot()
+    except (OSError, KeyError, ElementTree.ParseError, zipfile.BadZipFile):
+        return None
+
+    pages_el = root.find("ep:Pages", _APP_PROPS_NS)
+    if pages_el is None or not pages_el.text:
+        return None
+    try:
+        pages = int(pages_el.text)
+    except ValueError:
+        return None
+    return pages if pages > 0 else None
+
+
+def _pdf_page_count(path: Path) -> int:
+    src = fitz.open(path)
+    try:
+        return max(1, len(src))
+    finally:
+        src.close()
+
+
+def _docx_page_count(path: Path, *, soffice: str | None, warnings: list[str]) -> int:
+    if soffice:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="geo_pages_"))
+        try:
+            pdf_path = docx_to_pdf(soffice, path, tmp_dir)
+            return _pdf_page_count(pdf_path)
+        except Exception as e:
+            warnings.append(f"Не удалось точно посчитать страницы DOCX ({path.name}): {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    pages = _docx_extended_page_count(path)
+    if pages is not None:
+        return pages
+    warnings.append(f"Нумерация для DOCX может быть неточной, не удалось посчитать страницы: {path.name}")
+    return 1
+
+
+def _source_page_count(path: Path, *, soffice: str | None, warnings: list[str]) -> int:
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        try:
+            return _pdf_page_count(path)
+        except Exception as e:
+            warnings.append(f"Не удалось посчитать страницы PDF ({path.name}): {e}")
+            return 1
+    if ext == ".docx":
+        return _docx_page_count(path, soffice=soffice, warnings=warnings)
+    if ext in IMAGE_EXTS:
+        return 1
+    return 1
 
 
 def _prepend_heading(doc: Document, text: str) -> None:
@@ -100,6 +274,19 @@ def _ensure_section_like(doc: Document, source: Document) -> None:
     _copy_section_geometry(doc.sections[-1], source_section)
 
 
+def _start_new_part_section_like(doc: Document, source: Document, *, page_break: bool) -> None:
+    if not source.sections:
+        if _has_body_content(doc):
+            doc.add_section(WD_SECTION.NEW_PAGE if page_break else WD_SECTION.CONTINUOUS)
+        return
+    source_section = source.sections[0]
+    if not _has_body_content(doc):
+        _copy_section_geometry(doc.sections[-1], source_section)
+        return
+    doc.add_section(WD_SECTION.NEW_PAGE if page_break else WD_SECTION.CONTINUOUS)
+    _copy_section_geometry(doc.sections[-1], source_section)
+
+
 def _set_section_orientation(doc: Document, *, landscape: bool) -> None:
     section = doc.sections[-1]
     page_width, page_height = _section_page_size(section, fallback=None)
@@ -117,6 +304,12 @@ def _ensure_page_orientation(doc: Document, *, landscape: bool) -> None:
     if _section_is_landscape(doc) == landscape:
         return
     doc.add_section(WD_SECTION.NEW_PAGE)
+    _set_section_orientation(doc, landscape=landscape)
+
+
+def _start_new_part_section_for_orientation(doc: Document, *, landscape: bool, page_break: bool) -> None:
+    if _has_body_content(doc):
+        doc.add_section(WD_SECTION.NEW_PAGE if page_break else WD_SECTION.CONTINUOUS)
     _set_section_orientation(doc, landscape=landscape)
 
 
@@ -231,6 +424,29 @@ def _append_vector_image(doc: Document, image_path: Path, *, dpi: int) -> None:
         src.close()
 
 
+def _image_is_landscape(image_path: Path, *, dpi: int, warnings: list[str]) -> bool:
+    ext = image_path.suffix.lower()
+    try:
+        if ext in RASTER_IMAGE_EXTS:
+            image = DocxImage.from_file(str(image_path))
+            horz_dpi = image.horz_dpi or 72
+            vert_dpi = image.vert_dpi or horz_dpi
+            return (image.px_width / horz_dpi) > (image.px_height / vert_dpi)
+        if ext in VECTOR_IMAGE_EXTS:
+            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            src = fitz.open(stream=image_path.read_bytes(), filetype="svg")
+            try:
+                if len(src) == 0:
+                    return False
+                pix = src[0].get_pixmap(matrix=matrix, alpha=False)
+                return pix.width > pix.height
+            finally:
+                src.close()
+    except Exception as e:
+        warnings.append(f"Не удалось определить ориентацию изображения ({image_path.name}): {e}")
+    return False
+
+
 def _append_image(doc: Document, image_path: Path, *, dpi: int) -> None:
     ext = image_path.suffix.lower()
     if ext in RASTER_IMAGE_EXTS:
@@ -290,21 +506,32 @@ def merge_to_docx_and_pdf(
 
     merged: Document | None = None
     composer: Composer | None = None
+    part_sections: list[tuple[int, int, int]] = []
+    global_page_offset = 0
 
     output_docx = Path(output_docx)
     try:
         for idx, (src_path, display_name) in enumerate(work_items):
             ext = src_path.suffix.lower()
+            page_count = _source_page_count(src_path, soffice=soffice, warnings=warnings)
 
             if ext == ".pdf":
                 if merged is None:
                     merged = Document()
                     composer = None
-                elif page_break_between_parts:
-                    _append_page_break(merged)
+                section_start = 0 if not _has_body_content(merged) else len(merged.sections)
+                with fitz.open(src_path) as src_pdf:
+                    first_landscape = len(src_pdf) > 0 and src_pdf[0].rect.width > src_pdf[0].rect.height
+                _start_new_part_section_for_orientation(
+                    merged,
+                    landscape=first_landscape,
+                    page_break=page_break_between_parts,
+                )
                 if insert_titles:
                     merged.add_heading(display_name, level=2)
                 _append_pdf_as_images(merged, src_path, dpi=pdf_render_dpi)
+                part_sections.append((section_start, len(merged.sections) - 1, global_page_offset))
+                global_page_offset += page_count
                 continue
 
             if ext == ".docx":
@@ -313,33 +540,38 @@ def merge_to_docx_and_pdf(
                 if insert_titles:
                     _prepend_heading(doc, display_name)
                 if merged is not None:
-                    if (
-                        page_break_between_parts
-                        and doc.sections
-                        and _section_geometry_matches(merged.sections[-1], doc.sections[0])
-                    ):
-                        _append_page_break(merged)
-                    else:
-                        _ensure_section_like(merged, doc)
+                    section_start = len(merged.sections)
+                    _start_new_part_section_like(merged, doc, page_break=page_break_between_parts)
                 if merged is None:
                     merged = doc
                     composer = Composer(merged)
+                    section_start = 0
                 else:
                     if composer is None:
                         composer = Composer(merged)
                     composer.append(doc)
+                part_sections.append((section_start, len(merged.sections) - 1, global_page_offset))
+                global_page_offset += page_count
                 continue
 
         for src_path, display_name in image_items:
+            page_count = _source_page_count(src_path, soffice=soffice, warnings=warnings)
             if merged is None:
                 merged = Document()
                 composer = None
-            elif page_break_between_parts:
-                _append_page_break(merged)
+            section_start = 0 if not _has_body_content(merged) else len(merged.sections)
+            landscape = _image_is_landscape(src_path, dpi=pdf_render_dpi, warnings=warnings)
+            _start_new_part_section_for_orientation(
+                merged,
+                landscape=landscape,
+                page_break=page_break_between_parts,
+            )
             if insert_titles:
                 merged.add_heading(display_name, level=2)
             try:
                 _append_image(merged, src_path, dpi=pdf_render_dpi)
+                part_sections.append((section_start, len(merged.sections) - 1, global_page_offset))
+                global_page_offset += page_count
             except Exception as e:
                 warnings.append(f"Изображение не вставлено ({src_path.name}): {e}")
 
@@ -350,6 +582,7 @@ def merge_to_docx_and_pdf(
             return warnings, errors
 
         remove_empty_pages(merged)
+        _apply_page_numbering(merged, part_sections)
         output_docx.parent.mkdir(parents=True, exist_ok=True)
         merged.save(str(output_docx))
     except Exception as e:
