@@ -51,7 +51,7 @@ def _scale_drawings(root, max_cx: int, max_cy: int) -> None:
             extent = drawing.find(qn("wp:extent"))
             if extent is None:
                 continue
-            cx_attr, cy_attr = qn("wp:cx"), qn("wp:cy")
+            cx_attr, cy_attr = "cx", "cy"
             try:
                 cx = int(extent.get(cx_attr, 0))
                 cy = int(extent.get(cy_attr, 0))
@@ -63,6 +63,9 @@ def _scale_drawings(root, max_cx: int, max_cy: int) -> None:
             if scale < 1.0:
                 _scale_int_attr(extent, cx_attr, scale)
                 _scale_int_attr(extent, cy_attr, scale)
+                for pic_extent in drawing.iter(qn("a:ext")):
+                    _scale_int_attr(pic_extent, cx_attr, scale)
+                    _scale_int_attr(pic_extent, cy_attr, scale)
 
 
 def _table_width_twips(tbl_el, *, content_width_twips: int) -> int | None:
