@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from geo_documents.explanatory_dialog import ExplanatoryNoteDialog
 from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
 from geo_documents.merger import IMAGE_EXTS, merge_to_docx_and_pdf
 
@@ -166,6 +167,10 @@ class MainWindow(QWidget):
         self.btn_merge.clicked.connect(self._merge)
         root.addWidget(self.btn_merge)
 
+        self.btn_explanatory = QPushButton("Пояснительная записка (LLM)")
+        self.btn_explanatory.clicked.connect(self._open_explanatory_dialog)
+        root.addWidget(self.btn_explanatory)
+
         lo_hint = QLabel(
             "Для экспорта в PDF нужен LibreOffice: укажите путь к soffice.exe выше "
             "(или переменную окружения LIBREOFFICE_EXECUTABLE). Путь сохраняется между запусками. "
@@ -291,6 +296,17 @@ class MainWindow(QWidget):
         th.finished.connect(th.deleteLater)
         self.btn_merge.setEnabled(False)
         th.start()
+
+    def _open_explanatory_dialog(self) -> None:
+        base = self.ed_basename.text().strip() or "merged_report"
+        out_dir = self._folder if self._folder.is_dir() else Path.cwd()
+        suggested_context = out_dir / f"{base}.docx"
+        dialog = ExplanatoryNoteDialog(
+            initial_folder=out_dir,
+            suggested_context=suggested_context if suggested_context.is_file() else None,
+            parent=self,
+        )
+        dialog.exec()
 
     def _merge_ui_unlock(self) -> None:
         self.btn_merge.setEnabled(True)
