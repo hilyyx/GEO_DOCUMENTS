@@ -257,16 +257,19 @@ class MainWindow(QWidget):
         )
         if not files:
             return
-        existing = {str(Path(x).resolve()) for x in self._paths_from_list()}
         for f in files:
-            fp = Path(f).resolve()
-            key = str(fp)
-            if key in existing:
-                continue
-            existing.add(key)
-            it = QListWidgetItem(f"{fp.name}   [{_human_sort_key(fp.name)}]")
-            it.setData(Qt.ItemDataRole.UserRole, key)
-            self.list_w.addItem(it)
+            self._add_path_to_list(Path(f))
+
+    def _add_path_to_list(self, path: Path, *, display_name: str | None = None) -> None:
+        fp = path.resolve()
+        existing = {str(Path(x).resolve()) for x in self._paths_from_list()}
+        key = str(fp)
+        if key in existing:
+            return
+        name = display_name or fp.name
+        it = QListWidgetItem(f"{name}   [{_human_sort_key(name)}]")
+        it.setData(Qt.ItemDataRole.UserRole, key)
+        self.list_w.addItem(it)
 
     def _merge(self) -> None:
         if self._merge_thread is not None and self._merge_thread.isRunning():
@@ -306,7 +309,11 @@ class MainWindow(QWidget):
             suggested_context=suggested_context if suggested_context.is_file() else None,
             parent=self,
         )
+        dialog.generated.connect(self._on_explanatory_generated)
         dialog.exec()
+
+    def _on_explanatory_generated(self, path: str) -> None:
+        self._add_path_to_list(Path(path), display_name="1.4 ПЗ.docx")
 
     def _merge_ui_unlock(self) -> None:
         self.btn_merge.setEnabled(True)

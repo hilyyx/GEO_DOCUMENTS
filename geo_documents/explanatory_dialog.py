@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
 )
@@ -29,7 +33,7 @@ from geo_documents.explanatory_generator import (
     save_generation_result_docx,
 )
 from geo_documents.llm_ollama import DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, OllamaError, list_local_models
-from geo_documents.template_model import BlockType, ExplanationTemplate, TemplateBlock, slugify_template_id
+from geo_documents.template_model import BlockType, ExplanationTemplate, TableData, TemplateBlock, slugify_template_id
 from geo_documents.template_store import (
     delete_template,
     ensure_default_templates,
@@ -42,14 +46,19 @@ TYPE_LABELS: dict[BlockType, str] = {
     "plain": "Обычный",
     "fixed": "Жёлтый: неизменно",
     "generated": "Зелёный: найти/сгенерировать",
+    "table": "Таблица",
 }
 LABEL_TO_TYPE = {label: key for key, label in TYPE_LABELS.items()}
 TYPE_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 NOTE_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 COMMENT_MARKER_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
+TABLE_DATA_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
 FIXED_COLOR = QColor("#fff4a3")
 GENERATED_COLOR = QColor("#b8f5b1")
+TABLE_COLOR = QColor("#d9e8ff")
 COMMENT_MARKER = "💬"
+TABLE_PLACEHOLDER_PREFIX = "[[Таблица: "
+TABLE_PLACEHOLDER_SUFFIX = "]]"
 
 
 class _EditorCommentClickFilter(QObject):
@@ -77,6 +86,106 @@ class _EditorCommentClickFilter(QObject):
             if pos is not None and self._dialog._open_note_at_doc_pos(pos):
                 return True
         return super().eventFilter(obj, event)
+
+
+class _TableDialog(QDialog):
+    def __init__(self, *, table: TableData | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Таблица")
+        self.resize(640, 420)
+        self._table = table or TableData()
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.ed_title = QLineEdit(self._table.title)
+        self.sp_rows = QSpinBox()
+        self.sp_rows.setRange(1, 200)
+        self.sp_cols = QSpinBox()
+        self.sp_cols.setRange(1, 50)
+        form.addRow("Название:", self.ed_title)
+        form.addRow("Строк (включая шапку):", self.sp_rows)
+        form.addRow("Колонок:", self.sp_cols)
+        root.addLayout(form)
+
+        self.table = QTableWidget()
+        root.addWidget(self.table, stretch=1)
+
+        buttons = QHBoxLayout()
+        btn_ok = QPushButton("Применить")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_ok)
+        buttons.addWidget(btn_cancel)
+        root.addLayout(buttons)
+
+        self._apply_table_to_widget(self._table)
+        self.sp_rows.valueChanged.connect(self._resize_table)
+        self.sp_cols.valueChanged.connect(self._resize_table)
+
+    def _apply_table_to_widget(self, table: TableData) -> None:
+        rows = max(1, len(table.rows) + 1)
+        cols = max(1, len(table.headers) or max((len(r) for r in table.rows), default=1))
+        self.sp_rows.blockSignals(True)
+        self.sp_cols.blockSignals(True)
+        self.sp_rows.setValue(rows)
+        self.sp_cols.setValue(cols)
+        self.sp_rows.blockSignals(False)
+        self.sp_cols.blockSignals(False)
+        self._resize_table()
+        for col in range(cols):
+            header = table.headers[col] if col < len(table.headers) else ""
+            self.table.setItem(0, col, QTableWidgetItem(header))
+        for row_idx, row in enumerate(table.rows, start=1):
+            for col in range(cols):
+                cell = row[col] if col < len(row) else ""
+                self.table.setItem(row_idx, col, QTableWidgetItem(cell))
+
+    def _resize_table(self) -> None:
+        rows = self.sp_rows.value()
+        cols = self.sp_cols.value()
+        old_rows = self.table.rowCount()
+        old_cols = self.table.columnCount()
+        if rows == old_rows and cols == old_cols:
+            return
+        data: list[list[str]] = []
+        for r in range(old_rows):
+            row_data = []
+            for c in range(old_cols):
+                item = self.table.item(r, c)
+                row_data.append(item.text() if item else "")
+            data.append(row_data)
+        self.table.setRowCount(rows)
+        self.table.setColumnCount(cols)
+        for r in range(rows):
+            for c in range(cols):
+                value = data[r][c] if r < len(data) and c < len(data[r]) else ""
+                if value:
+                    self.table.setItem(r, c, QTableWidgetItem(value))
+
+    def table_data(self) -> TableData:
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+        headers: list[str] = []
+        for col in range(cols):
+            item = self.table.item(0, col)
+            value = item.text().strip() if item else ""
+            headers.append(value)
+        if not any(headers):
+            headers = [f"Колонка {idx + 1}" for idx in range(cols)]
+        body_rows: list[list[str]] = []
+        for row in range(1, rows):
+            row_data: list[str] = []
+            for col in range(cols):
+                item = self.table.item(row, col)
+                row_data.append(item.text().strip() if item else "")
+            body_rows.append(row_data)
+        return TableData(
+            title=self.ed_title.text().strip(),
+            headers=headers,
+            rows=body_rows,
+        )
 
 
 class _GenerateThread(QThread):
@@ -119,6 +228,8 @@ class _GenerateThread(QThread):
 
 
 class ExplanatoryNoteDialog(QDialog):
+    generated = pyqtSignal(str)
+
     def __init__(self, *, initial_folder: Path, suggested_context: Path | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Пояснительная записка через локальную LLM")
@@ -163,7 +274,8 @@ class ExplanatoryNoteDialog(QDialog):
         hint = QLabel(
             "Пишите цельный текст шаблона. Выделите фрагмент и нажмите: "
             "жёлтый — неизменяемый текст, зелёный — место для поиска/генерации по документу. "
-            "К фрагменту можно добавить заметку кнопкой «💬 Заметка» или нажатием на значок 💬."
+            "К фрагменту можно добавить заметку кнопкой «💬 Заметка» или нажатием на значок 💬. "
+            "Таблицы вставляются отдельной кнопкой."
         )
         hint.setWordWrap(True)
         editor_layout.addWidget(hint)
@@ -184,12 +296,15 @@ class ExplanatoryNoteDialog(QDialog):
         btn_plain.clicked.connect(self._clear_selection_format)
         btn_note = QPushButton(f"{COMMENT_MARKER} Заметка")
         btn_note.clicked.connect(self._set_selection_note)
+        btn_table = QPushButton("Вставить таблицу")
+        btn_table.clicked.connect(self._insert_or_edit_table)
         btn_save = QPushButton("Сохранить шаблон")
         btn_save.clicked.connect(self._save_current_template)
         block_buttons.addWidget(btn_fixed)
         block_buttons.addWidget(btn_generated)
         block_buttons.addWidget(btn_plain)
         block_buttons.addWidget(btn_note)
+        block_buttons.addWidget(btn_table)
         block_buttons.addStretch(1)
         block_buttons.addWidget(btn_save)
         root.addLayout(block_buttons)
@@ -205,7 +320,7 @@ class ExplanatoryNoteDialog(QDialog):
         gen_form.addRow("Документ-контекст:", row_context)
 
         row_output = QHBoxLayout()
-        default_out = initial_folder / "explanatory_note_generated.docx"
+        default_out = initial_folder / "1.4 ПЗ.docx"
         self.ed_output = QLineEdit(str(default_out))
         btn_output = QPushButton("Куда сохранить…")
         btn_output.clicked.connect(self._pick_output)
@@ -326,6 +441,8 @@ class ExplanatoryNoteDialog(QDialog):
     def _char_format_for_block(self, block: TemplateBlock) -> QTextCharFormat:
         fmt = QTextCharFormat()
         fmt.setProperty(TYPE_PROPERTY, block.type)
+        if block.type == "table" and block.table is not None:
+            fmt.setProperty(TABLE_DATA_PROPERTY, json.dumps(block.table.to_dict(), ensure_ascii=False))
         if block.note:
             fmt.setProperty(NOTE_PROPERTY, block.note)
             fmt.setToolTip(block.note)
@@ -333,9 +450,14 @@ class ExplanatoryNoteDialog(QDialog):
             fmt.setBackground(FIXED_COLOR)
         elif block.type == "generated":
             fmt.setBackground(GENERATED_COLOR)
+        elif block.type == "table":
+            fmt.setBackground(TABLE_COLOR)
         return fmt
 
     def _insert_block(self, cursor: QTextCursor, block: TemplateBlock) -> None:
+        if block.type == "table":
+            cursor.insertText(self._table_placeholder(block.table), self._char_format_for_block(block))
+            return
         cursor.insertText(block.text, self._char_format_for_block(block))
         if block.note:
             cursor.insertText(COMMENT_MARKER, self._comment_marker_format(block.note))
@@ -348,15 +470,45 @@ class ExplanatoryNoteDialog(QDialog):
         fmt.setToolTip(note)
         return fmt
 
+    def _table_placeholder(self, table: TableData | None) -> str:
+        title = (table.title if table else "").strip()
+        if not title:
+            title = "без названия"
+        return f"{TABLE_PLACEHOLDER_PREFIX}{title}{TABLE_PLACEHOLDER_SUFFIX}"
+
+    def _table_format(self, table: TableData) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setProperty(TYPE_PROPERTY, "table")
+        fmt.setBackground(TABLE_COLOR)
+        fmt.setProperty(TABLE_DATA_PROPERTY, json.dumps(table.to_dict(), ensure_ascii=False))
+        return fmt
+
+    def _table_data_from_format(self, fmt: QTextCharFormat) -> TableData | None:
+        raw = fmt.property(TABLE_DATA_PROPERTY)
+        if not raw:
+            return None
+        try:
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                return None
+            return TableData.from_dict(data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def _block_type_from_format(self, fmt: QTextCharFormat) -> BlockType:
         prop = fmt.property(TYPE_PROPERTY)
-        if prop in {"fixed", "generated", "plain"}:
+        if prop in {"fixed", "generated", "plain", "table"}:
             return prop
         color = fmt.background().color()
         if color == FIXED_COLOR:
             return "fixed"
         if color == GENERATED_COLOR:
             return "generated"
+        if color == TABLE_COLOR:
+            return "table"
         return "plain"
 
     def _blocks_from_editor(self) -> list[TemplateBlock]:
@@ -367,6 +519,7 @@ class ExplanatoryNoteDialog(QDialog):
 
         current_type: BlockType | None = None
         current_note = ""
+        current_table: TableData | None = None
         current_text: list[str] = []
 
         for pos, char in enumerate(text):
@@ -378,18 +531,34 @@ class ExplanatoryNoteDialog(QDialog):
                 continue
             block_type = self._block_type_from_format(fmt)
             # Неразмеченный текст нужен пользователю как каркас шаблона, но не как блок результата.
-            note = str(fmt.property(NOTE_PROPERTY) or "") if block_type != "plain" else ""
-            if block_type != current_type or note != current_note:
+            note = str(fmt.property(NOTE_PROPERTY) or "") if block_type not in {"plain", "table"} else ""
+            table_data = self._table_data_from_format(fmt) if block_type == "table" else None
+            if block_type != current_type or note != current_note or (block_type == "table" and table_data != current_table):
                 if current_text and current_type is not None:
-                    blocks.append(TemplateBlock.create(type=current_type, text="".join(current_text), note=current_note))
+                    blocks.append(
+                        TemplateBlock.create(
+                            type=current_type,
+                            text="".join(current_text),
+                            note=current_note,
+                            table=current_table,
+                        )
+                    )
                 current_type = block_type
                 current_note = note
+                current_table = table_data
                 current_text = [char]
             else:
                 current_text.append(char)
 
         if current_text and current_type is not None:
-            blocks.append(TemplateBlock.create(type=current_type, text="".join(current_text), note=current_note))
+            blocks.append(
+                TemplateBlock.create(
+                    type=current_type,
+                    text="".join(current_text),
+                    note=current_note,
+                    table=current_table,
+                )
+            )
         return self._merge_adjacent_blocks(blocks)
 
     def _merge_adjacent_blocks(self, blocks: list[TemplateBlock]) -> list[TemplateBlock]:
@@ -398,6 +567,9 @@ class ExplanatoryNoteDialog(QDialog):
             if not block.text:
                 continue
             if block.type == "plain":
+                continue
+            if block.type == "table":
+                merged.append(block)
                 continue
             if merged and merged[-1].type == block.type and merged[-1].note == block.note:
                 merged[-1].text += block.text
@@ -434,6 +606,47 @@ class ExplanatoryNoteDialog(QDialog):
             return
         current_note = str(cursor.charFormat().property(NOTE_PROPERTY) or "")
         self._edit_note_for_cursor(cursor, current_note=current_note)
+
+    def _table_target_at_doc_pos(self, doc_pos: int) -> tuple[QTextCursor, TableData] | None:
+        text = self.editor.toPlainText()
+        if not text:
+            return None
+        pos = min(max(doc_pos, 0), len(text) - 1)
+        fmt = self._char_format_at(pos)
+        if self._block_type_from_format(fmt) != "table":
+            return None
+        table_data = self._table_data_from_format(fmt)
+        if table_data is None:
+            return None
+        left = pos
+        while left > 0 and self._block_type_from_format(self._char_format_at(left - 1)) == "table":
+            left -= 1
+        right = pos
+        while right + 1 < len(text) and self._block_type_from_format(self._char_format_at(right + 1)) == "table":
+            right += 1
+        target = QTextCursor(self.editor.document())
+        target.setPosition(left)
+        target.setPosition(right + 1, QTextCursor.MoveMode.KeepAnchor)
+        return target, table_data
+
+    def _table_target_cursor(self) -> tuple[QTextCursor, TableData] | None:
+        cursor = self.editor.textCursor()
+        pos = cursor.selectionStart() if cursor.hasSelection() else cursor.position()
+        return self._table_target_at_doc_pos(pos)
+
+    def _insert_or_edit_table(self) -> None:
+        existing = self._table_target_cursor()
+        existing_table = existing[1] if existing else None
+        dialog = _TableDialog(table=existing_table, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        table_data = dialog.table_data()
+        if existing:
+            target, _ = existing
+            target.insertText(self._table_placeholder(table_data), self._table_format(table_data))
+        else:
+            cursor = self.editor.textCursor()
+            cursor.insertText(self._table_placeholder(table_data), self._table_format(table_data))
 
     def _doc_pos_from_viewport(self, pos: QPointF) -> int | None:
         cursor = self.editor.cursorForPosition(pos.toPoint())
@@ -572,7 +785,7 @@ class ExplanatoryNoteDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить пояснительную записку",
-            self.ed_output.text() or str(self._initial_folder / "explanatory_note_generated.docx"),
+            self.ed_output.text() or str(self._initial_folder / "1.4 ПЗ.docx"),
             "DOCX (*.docx)",
         )
         if path:
@@ -613,6 +826,7 @@ class ExplanatoryNoteDialog(QDialog):
         self.btn_generate.setEnabled(True)
         self.preview.setPlainText(text)
         QMessageBox.information(self, "Готово", f"Пояснительная записка сохранена:\n{path}")
+        self.generated.emit(path)
 
     def _on_crashed(self, tb: str) -> None:
         self.btn_generate.setEnabled(True)

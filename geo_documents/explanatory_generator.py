@@ -7,13 +7,14 @@ from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
 
 from geo_documents.llm_ollama import DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, generate_text
-from geo_documents.template_model import ExplanationTemplate, TemplateBlock
+from geo_documents.template_model import ExplanationTemplate, TableData, TemplateBlock
 
 
 @dataclass
 class GeneratedBlock:
     source: TemplateBlock
     text: str
+    table: TableData | None = None
 
 
 @dataclass
@@ -63,6 +64,9 @@ def generate_explanatory_note(
         if block.type == "fixed":
             blocks.append(GeneratedBlock(source=block, text=block.text))
             continue
+        if block.type == "table":
+            blocks.append(GeneratedBlock(source=block, text=block.text, table=block.table))
+            continue
 
         task = build_block_task(template, block)
         generated = generate_text(
@@ -81,6 +85,8 @@ def generate_explanatory_note(
 
 
 def _add_text_block(doc: Document, block: GeneratedBlock, *, keep_highlight: bool) -> None:
+    if block.source.type == "table":
+        return
     text = block.text.strip()
     if not text:
         return
@@ -106,8 +112,37 @@ def save_generation_result_docx(
 ) -> Path:
     doc = Document()
     for block in result.blocks:
-        _add_text_block(doc, block, keep_highlight=keep_highlight)
+        if block.source.type == "table":
+            _add_table_block(doc, block.table)
+        else:
+            _add_text_block(doc, block, keep_highlight=keep_highlight)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output))
     return output
+
+
+def _add_table_block(doc: Document, table: TableData | None) -> None:
+    if table is None:
+        return
+    headers = table.headers
+    rows = table.rows
+    if not headers and not rows:
+        return
+    if table.title:
+        title_par = doc.add_paragraph()
+        title_run = title_par.add_run(table.title)
+        title_run.bold = True
+    col_count = max(len(headers), max((len(r) for r in rows), default=0), 1)
+    header_row = headers if headers else [f"Колонка {idx + 1}" for idx in range(col_count)]
+    table_rows = [header_row] + rows
+    tbl = doc.add_table(rows=len(table_rows), cols=col_count)
+    tbl.style = "Table Grid"
+    for row_idx, row in enumerate(table_rows):
+        for col_idx in range(col_count):
+            cell_text = row[col_idx] if col_idx < len(row) else ""
+            cell = tbl.cell(row_idx, col_idx)
+            cell.text = str(cell_text)
+            if row_idx == 0:
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True

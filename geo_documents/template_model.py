@@ -6,7 +6,39 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-BlockType = Literal["plain", "fixed", "generated"]
+BlockType = Literal["plain", "fixed", "generated", "table"]
+
+
+@dataclass
+class TableData:
+    title: str = ""
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "TableData":
+        if not isinstance(data, dict):
+            return cls()
+        headers = [str(item) for item in data.get("headers", []) if str(item).strip()]
+        raw_rows = data.get("rows", [])
+        rows: list[list[str]] = []
+        if isinstance(raw_rows, list):
+            for row in raw_rows:
+                if not isinstance(row, list):
+                    continue
+                rows.append([str(cell) for cell in row])
+        return cls(
+            title=str(data.get("title") or ""),
+            headers=headers,
+            rows=rows,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "headers": self.headers,
+            "rows": self.rows,
+        }
 
 
 def new_block_id() -> str:
@@ -24,29 +56,42 @@ class TemplateBlock:
     type: BlockType
     text: str
     note: str = ""
+    table: TableData | None = None
 
     @classmethod
-    def create(cls, *, type: BlockType = "plain", text: str = "", note: str = "") -> "TemplateBlock":
-        return cls(id=new_block_id(), type=type, text=text, note=note)
+    def create(
+        cls,
+        *,
+        type: BlockType = "plain",
+        text: str = "",
+        note: str = "",
+        table: TableData | None = None,
+    ) -> "TemplateBlock":
+        return cls(id=new_block_id(), type=type, text=text, note=note, table=table)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TemplateBlock":
         raw_type = data.get("type", "plain")
-        block_type: BlockType = raw_type if raw_type in {"plain", "fixed", "generated"} else "plain"
+        block_type: BlockType = raw_type if raw_type in {"plain", "fixed", "generated", "table"} else "plain"
+        table = TableData.from_dict(data.get("table")) if block_type == "table" else None
         return cls(
             id=str(data.get("id") or new_block_id()),
             type=block_type,
             text=str(data.get("text") or ""),
             note=str(data.get("note") or ""),
+            table=table,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.id,
             "type": self.type,
             "text": self.text,
             "note": self.note,
         }
+        if self.type == "table" and self.table is not None:
+            payload["table"] = self.table.to_dict()
+        return payload
 
 
 @dataclass
