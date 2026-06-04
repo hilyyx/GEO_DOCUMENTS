@@ -3,8 +3,8 @@ from __future__ import annotations
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QTextFormat
+from PyQt6.QtCore import QEvent, QObject, QPointF, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QTextCharFormat, QTextCursor, QTextFormat
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -50,6 +50,33 @@ COMMENT_MARKER_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
 FIXED_COLOR = QColor("#fff4a3")
 GENERATED_COLOR = QColor("#b8f5b1")
 COMMENT_MARKER = "💬"
+
+
+class _EditorCommentClickFilter(QObject):
+    """Открывает заметку по клику на значок комментария в редакторе шаблона."""
+
+    def __init__(self, dialog: "ExplanatoryNoteDialog") -> None:
+        super().__init__()
+        self._dialog = dialog
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is not self._dialog.editor.viewport():
+            return super().eventFilter(obj, event)
+
+        if event.type() == QEvent.Type.MouseMove:
+            pos = self._dialog._doc_pos_from_viewport(event.position())
+            text = self._dialog.editor.toPlainText()
+            if pos is not None and 0 <= pos < len(text) and text[pos] == COMMENT_MARKER:
+                self._dialog.editor.viewport().setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            else:
+                self._dialog.editor.viewport().unsetCursor()
+            return False
+
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            pos = self._dialog._doc_pos_from_viewport(event.position())
+            if pos is not None and self._dialog._open_note_at_doc_pos(pos):
+                return True
+        return super().eventFilter(obj, event)
 
 
 class _GenerateThread(QThread):
@@ -134,14 +161,17 @@ class ExplanatoryNoteDialog(QDialog):
         editor_group = QGroupBox("Текст шаблона")
         editor_layout = QVBoxLayout(editor_group)
         hint = QLabel(
-            "Пишите цельный текст шаблона. Выделите фрагмент мышью и нажмите: "
-            "жёлтый — неизменяемый текст, зелёный — место, которое нужно найти/сгенерировать по документу. "
-            "К выделенному фрагменту можно добавить заметку-инструкцию."
+            "Пишите цельный текст шаблона. Выделите фрагмент и нажмите: "
+            "жёлтый — неизменяемый текст, зелёный — место для поиска/генерации по документу. "
+            "К фрагменту можно добавить заметку кнопкой «💬 Заметка» или нажатием на значок 💬."
         )
         hint.setWordWrap(True)
         editor_layout.addWidget(hint)
         self.editor = QTextEdit()
         self.editor.setAcceptRichText(False)
+        self.editor.setMouseTracking(True)
+        self._editor_click_filter = _EditorCommentClickFilter(self)
+        self.editor.viewport().installEventFilter(self._editor_click_filter)
         editor_layout.addWidget(self.editor, stretch=1)
         root.addWidget(editor_group, stretch=2)
 
@@ -154,15 +184,12 @@ class ExplanatoryNoteDialog(QDialog):
         btn_plain.clicked.connect(self._clear_selection_format)
         btn_note = QPushButton(f"{COMMENT_MARKER} Заметка")
         btn_note.clicked.connect(self._set_selection_note)
-        btn_note_current = QPushButton("Открыть заметку")
-        btn_note_current.clicked.connect(self._edit_note_at_cursor)
         btn_save = QPushButton("Сохранить шаблон")
         btn_save.clicked.connect(self._save_current_template)
         block_buttons.addWidget(btn_fixed)
         block_buttons.addWidget(btn_generated)
         block_buttons.addWidget(btn_plain)
         block_buttons.addWidget(btn_note)
-        block_buttons.addWidget(btn_note_current)
         block_buttons.addStretch(1)
         block_buttons.addWidget(btn_save)
         root.addLayout(block_buttons)
@@ -408,13 +435,61 @@ class ExplanatoryNoteDialog(QDialog):
         current_note = str(cursor.charFormat().property(NOTE_PROPERTY) or "")
         self._edit_note_for_cursor(cursor, current_note=current_note)
 
-    def _edit_note_at_cursor(self) -> None:
-        cursor = self._note_target_cursor()
-        if cursor is None:
-            QMessageBox.warning(self, "Заметка", "Поставьте курсор на выделенный фрагмент или значок комментария.")
-            return
-        note = str(cursor.charFormat().property(NOTE_PROPERTY) or "")
-        self._edit_note_for_cursor(cursor, current_note=note)
+    def _doc_pos_from_viewport(self, pos: QPointF) -> int | None:
+        cursor = self.editor.cursorForPosition(pos.toPoint())
+        return cursor.position()
+
+    def _open_note_at_doc_pos(self, doc_pos: int) -> bool:
+        text = self.editor.toPlainText()
+        if not text or doc_pos < 0 or doc_pos >= len(text):
+            return False
+
+        if text[doc_pos] == COMMENT_MARKER:
+            note = str(self._char_format_at(doc_pos).property(NOTE_PROPERTY) or "")
+            colored_end = doc_pos
+            left = colored_end
+            while left > 0 and text[left - 1] != COMMENT_MARKER:
+                if self._block_type_from_format(self._char_format_at(left - 1)) != self._block_type_from_format(
+                    self._char_format_at(colored_end - 1)
+                ):
+                    break
+                left -= 1
+            target = QTextCursor(self.editor.document())
+            target.setPosition(left)
+            target.setPosition(colored_end, QTextCursor.MoveMode.KeepAnchor)
+            self._edit_note_for_cursor(target, current_note=note)
+            return True
+
+        target = self._note_target_at_doc_pos(doc_pos)
+        if target is None:
+            return False
+        note = str(target.charFormat().property(NOTE_PROPERTY) or "")
+        if not note:
+            return False
+        self._edit_note_for_cursor(target, current_note=note)
+        return True
+
+    def _note_target_at_doc_pos(self, doc_pos: int) -> QTextCursor | None:
+        text = self.editor.toPlainText()
+        if not text:
+            return None
+        pos = min(max(doc_pos, 0), len(text) - 1)
+        fmt = self._char_format_at(pos)
+        if self._block_type_from_format(fmt) == "plain":
+            return None
+
+        left = pos
+        while left > 0 and text[left - 1] != COMMENT_MARKER and self._block_type_from_format(self._char_format_at(left - 1)) == self._block_type_from_format(fmt):
+            left -= 1
+
+        right = pos
+        while right + 1 < len(text) and text[right + 1] != COMMENT_MARKER and self._block_type_from_format(self._char_format_at(right + 1)) == self._block_type_from_format(fmt):
+            right += 1
+
+        target = QTextCursor(self.editor.document())
+        target.setPosition(left)
+        target.setPosition(right + 1, QTextCursor.MoveMode.KeepAnchor)
+        return target
 
     def _char_format_at(self, pos: int) -> QTextCharFormat:
         cursor = QTextCursor(self.editor.document())
