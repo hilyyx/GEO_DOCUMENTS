@@ -12,7 +12,10 @@ from docx import Document
 
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "gemma4:e4b"
+# Gemma4 — мультимодальная линейка, даже e2b часто не влезает в 8 ГБ RAM.
+# Для слабых ПК: gemma3:1b, gemma2:2b или phi3:mini (только текст).
+DEFAULT_MODEL = "gemma3:1b"
+LOW_RAM_MODEL_HINT = "gemma3:1b, gemma2:2b или phi3:mini"
 DEFAULT_SYSTEM_PROMPT = (
     "Ты локальный помощник для подготовки инженерно-геологических отчетов. "
     "Пиши по-русски, деловым техническим стилем. Используй только предоставленный "
@@ -145,6 +148,25 @@ def build_context_prompt(
     )
 
 
+def _format_ollama_http_error(host: str, error: urllib.error.HTTPError) -> str:
+    body = ""
+    try:
+        body = error.read().decode("utf-8", errors="replace")
+        detail = json.loads(body).get("error", body) if body else ""
+    except (json.JSONDecodeError, AttributeError):
+        detail = body
+    detail_lower = str(detail).lower()
+    if "allocate" in detail_lower or "out of memory" in detail_lower or "unable to allocate" in detail_lower:
+        return (
+            f"Недостаточно оперативной памяти для модели ({error.code}). "
+            f"Gemma4 (e2b/e4b) тяжёлая даже для текста. Закройте лишние программы, "
+            f"затем: ollama pull {LOW_RAM_MODEL_HINT.split(',')[0]} и "
+            f"--model {LOW_RAM_MODEL_HINT.split(',')[0]} --low-memory. "
+            f"Детали: {detail}"
+        )
+    return f"Ollama вернула ошибку HTTP {error.code}: {detail or error.reason}"
+
+
 def _post_json(host: str, endpoint: str, payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
     url = f"{_normalize_host(host)}{endpoint}"
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -157,11 +179,15 @@ def _post_json(host: str, endpoint: str, payload: dict[str, Any], *, timeout: in
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise OllamaError(_format_ollama_http_error(host, e)) from e
     except urllib.error.URLError as e:
-        raise OllamaError(
-            "Ollama недоступна. Проверьте, что Ollama установлена и запущена "
-            f"на {_normalize_host(host)}."
-        ) from e
+        if isinstance(e.reason, ConnectionRefusedError) or "refused" in str(e).lower():
+            raise OllamaError(
+                "Ollama недоступна. Запустите приложение Ollama или проверьте адрес "
+                f"{_normalize_host(host)}."
+            ) from e
+        raise OllamaError(f"Ошибка соединения с Ollama: {e}") from e
     except json.JSONDecodeError as e:
         raise OllamaError("Ollama вернула некорректный JSON-ответ.") from e
 
@@ -193,8 +219,18 @@ def generate_text(
     timeout: int = 180,
     max_chars_per_file: int = 12_000,
     max_total_chars: int = 30_000,
+    num_ctx: int | None = None,
+    low_memory: bool = False,
 ) -> str:
     """Генерирует текст через локальную Ollama-модель с учетом контекста документов."""
+    if low_memory:
+        max_chars_per_file = min(max_chars_per_file, 4_000)
+        max_total_chars = min(max_total_chars, 8_000)
+        if num_ctx is None:
+            num_ctx = 2048
+    elif num_ctx is None:
+        num_ctx = 8192
+
     contexts = read_document_context(context_paths, max_chars_per_file=max_chars_per_file)
     prompt = build_context_prompt(task, contexts, max_total_chars=max_total_chars)
     payload = {
@@ -204,7 +240,7 @@ def generate_text(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        "options": {"temperature": temperature},
+        "options": {"temperature": temperature, "num_ctx": num_ctx},
     }
     response = _post_json(host, "/api/chat", payload, timeout=timeout)
 

@@ -23,7 +23,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Генерация текста через локальную Ollama/Gemma с учетом контекста документов."
     )
-    parser.add_argument("task", help="Что нужно сгенерировать.")
+    parser.add_argument("task", nargs="?", default=None, help="Что нужно сгенерировать.")
     parser.add_argument("files", nargs="*", type=Path, help="DOCX/PDF/TXT/MD файлы для контекста.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Модель Ollama, по умолчанию {DEFAULT_MODEL}.")
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help=f"Адрес Ollama, по умолчанию {DEFAULT_OLLAMA_HOST}.")
@@ -34,6 +34,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-chars", type=int, default=30_000, help="Общий лимит контекста.")
     parser.add_argument("--list-models", action="store_true", help="Показать локальные модели Ollama и выйти.")
     parser.add_argument("--dry-run", action="store_true", help="Не вызывать Ollama, только показать собранный промпт.")
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Меньше контекста и num_ctx=2048 (для ПК с малым объёмом RAM).",
+    )
+    parser.add_argument("--num-ctx", type=int, default=None, help="Размер контекста Ollama (меньше — меньше RAM).")
     return parser.parse_args()
 
 
@@ -42,9 +48,12 @@ def main() -> int:
 
     try:
         if args.list_models:
-            for model in list_local_models(args.host, timeout=args.timeout):
+            for model in list_local_models(args.host, timeout=min(args.timeout, 10)):
                 print(model)
             return 0
+
+        if not args.task:
+            parser.error("Укажите задачу (task), например: \"Сформируй вывод по документу\"")
 
         if args.dry_run:
             contexts = read_document_context(args.files, max_chars_per_file=args.max_chars_per_file)
@@ -60,6 +69,8 @@ def main() -> int:
             timeout=args.timeout,
             max_chars_per_file=args.max_chars_per_file,
             max_total_chars=args.max_total_chars,
+            num_ctx=args.num_ctx,
+            low_memory=args.low_memory,
         )
     except OllamaError as e:
         print(f"Ошибка Ollama: {e}")
